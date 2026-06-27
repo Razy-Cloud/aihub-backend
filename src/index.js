@@ -10,7 +10,8 @@ const { v4: uuidv4 } = require('uuid');
 // ===== 初始化 =====
 const app = express();
 const JWT_SECRET = process.env.JWT_SECRET || 'aihub-dev-2026';
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'aihub.db');
+// 持久化路径：优先使用 DB_PATH；在 Railway 环境默认使用 /data/aihub.db，便于挂载 Railway Volume
+const DB_PATH = process.env.DB_PATH || (process.env.RAILWAY_ENVIRONMENT_NAME ? '/data/aihub.db' : path.join(__dirname, 'data', 'aihub.db'));
 
 // PayPal 配置
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
@@ -20,6 +21,8 @@ const PAYPAL_ENV = process.env.PAYPAL_ENV || 'sandbox'; // sandbox 或 live
 // 确保数据目录
 const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+
+console.log('[DB] Database path:', DB_PATH, process.env.RAILWAY_ENVIRONMENT_NAME ? '(Railway)' : '(local)');
 
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
