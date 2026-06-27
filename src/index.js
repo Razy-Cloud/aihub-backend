@@ -6,16 +6,16 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
-const Stripe = require('stripe');
 
 // ===== 初始化 =====
 const app = express();
 const JWT_SECRET = process.env.JWT_SECRET || 'aihub-dev-2026';
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'aihub.db');
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY || '', {
-  apiVersion: '2024-06-20',
-  appInfo: { name: 'AIHub', version: '1.0.0' },
-});
+
+// PayPal 配置
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || '';
+const PAYPAL_ENV = process.env.PAYPAL_ENV || 'sandbox'; // sandbox 或 live
 
 // 确保数据目录
 const dbDir = path.dirname(DB_PATH);
@@ -103,37 +103,11 @@ if (!adminExists) {
   console.log('[DB] Admin created: phone=13800000000 password=admin123456');
 }
 
-// 兼容旧表：添加 Stripe 相关字段
+// 兼容旧表：添加 PayPal 相关字段
 try { db.exec('ALTER TABLE orders ADD COLUMN paid_at TEXT'); } catch (e) {}
-try { db.exec('ALTER TABLE orders ADD COLUMN stripe_session_id TEXT'); } catch (e) {}
+try { db.exec('ALTER TABLE orders ADD COLUMN paypal_order_id TEXT'); } catch (e) {}
 
 // ===== 中间件 =====
-// Stripe Webhook 必须在 express.json() 之前，使用 raw body
-app.post('/api/payment/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET || '';
-  let event;
-  try {
-    event = endpointSecret ? stripe.webhooks.constructEvent(req.body, sig, endpointSecret) : JSON.parse(req.body);
-  } catch (err) {
-    console.error('[Stripe Webhook] 验证失败:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const orderId = session.client_reference_id;
-    if (!orderId) return res.json({ received: true });
-    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
-    if (order && order.status === 'pending') {
-      db.prepare('UPDATE orders SET status = ?, paid_at = datetime("now","localtime"), stripe_session_id = ? WHERE id = ?').run('paid', session.id, orderId);
-      db.prepare('UPDATE users SET credits = credits + ?, total_recharged = total_recharged + ? WHERE id = ?').run(order.credits, order.credits, order.user_id);
-      db.prepare('INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, related_order_id) VALUES (?, "recharge", ?, (SELECT credits FROM users WHERE id = ?), "payment", ?, ?)').run(order.user_id, order.credits, order.user_id, `Stripe 充值-${order.package_name}`, orderId);
-      console.log('[Stripe Webhook] 订单已到账:', orderId, 'credits:', order.credits);
-    }
-  }
-  res.json({ received: true });
-});
-
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(require('cors')());
@@ -302,8 +276,32 @@ app.get('/api/payment/packages', (req, res) => {
   });
 });
 
-// --- Stripe Checkout 支付 ---
-app.post('/api/payment/create-stripe-session', auth, async (req, res) => {
+// --- PayPal 支付 ---
+
+// 获取 PayPal Access Token
+async function getPayPalAccessToken() {
+  const clientId = process.env.PAYPAL_CLIENT_ID || '';
+  const clientSecret = process.env.PAYPAL_CLIENT_SECRET || '';
+  const baseUrl = process.env.PAYPAL_ENV === 'live'
+    ? 'https://api.paypal.com'
+    : 'https://api.sandbox.paypal.com';
+
+  const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+  const response = await fetch(`${baseUrl}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials',
+  });
+
+  const data = await response.json();
+  return data.access_token;
+}
+
+// 创建 PayPal 订单
+app.post('/api/payment/create-paypal-order', auth, async (req, res) => {
   const { packageId } = req.body;
   const pkgMap = {
     pkg_9: { price: 9.9, credits: 100, name: 'AIHub 体验档' },
@@ -314,39 +312,110 @@ app.post('/api/payment/create-stripe-session', auth, async (req, res) => {
   const pkg = pkgMap[packageId];
   if (!pkg) return res.status(400).json({ error: '套餐不存在' });
 
-  if (!process.env.STRIPE_SECRET_KEY) {
-    return res.status(400).json({ error: 'Stripe 未配置，请联系管理员' });
+  if (!process.env.PAYPAL_CLIENT_ID || !process.env.PAYPAL_CLIENT_SECRET) {
+    return res.status(400).json({ error: 'PayPal 未配置，请联系管理员' });
   }
 
   const orderId = 'ORD' + Date.now();
   db.prepare("INSERT INTO orders (id, user_id, package_name, amount, credits, status) VALUES (?, ?, ?, ?, ?, 'pending')").run(orderId, req.user.id, packageId, pkg.price, pkg.credits);
 
-  const successUrl = req.body.returnUrl || `${process.env.FRONTEND_URL || 'https://aihub-frontend-pyom.vercel.app'}/#/credits?paid=success&order=${orderId}`;
-  const cancelUrl = req.body.cancelUrl || `${process.env.FRONTEND_URL || 'https://aihub-frontend-pyom.vercel.app'}/#/credits?paid=cancel`;
-
   try {
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [{
-        price_data: {
-          currency: 'cny',
-          product_data: { name: pkg.name, description: `充值 ${pkg.credits} 积分` },
-          unit_amount: Math.round(pkg.price * 100),
+    const accessToken = await getPayPalAccessToken();
+    const baseUrl = process.env.PAYPAL_ENV === 'live'
+      ? 'https://api.paypal.com'
+      : 'https://api.sandbox.paypal.com';
+
+    const paypalOrder = await fetch(`${baseUrl}/v2/checkout/orders`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        intent: 'CAPTURE',
+        purchase_units: [{
+          reference_id: orderId,
+          amount: {
+            currency_code: 'USD',
+            value: pkg.price.toFixed(2),
+          },
+          description: `充值 ${pkg.credits} 积分`,
+        }],
+        application_context: {
+          return_url: `${process.env.FRONTEND_URL || 'https://aihub-frontend-pyom.vercel.app'}/#/credits?paid=success&order=${orderId}`,
+          cancel_url: `${process.env.FRONTEND_URL || 'https://aihub-frontend-pyom.vercel.app'}/#/credits?paid=cancel`,
         },
-        quantity: 1,
-      }],
-      mode: 'payment',
-      success_url: successUrl,
-      cancel_url: cancelUrl,
-      client_reference_id: orderId,
-      metadata: { user_id: String(req.user.id), package_name: packageId, credits: String(pkg.credits) },
+      }),
     });
 
-    db.prepare('UPDATE orders SET stripe_session_id = ? WHERE id = ?').run(session.id, orderId);
-    res.json({ success: true, orderId, url: session.url, sessionId: session.id });
+    const paypalData = await paypalOrder.json();
+
+    if (!paypalOrder.ok) {
+      console.error('[PayPal] 创建订单失败:', paypalData);
+      return res.status(500).json({ error: 'PayPal 订单创建失败' });
+    }
+
+    // 保存 PayPal 订单 ID
+    db.prepare('UPDATE orders SET paypal_order_id = ? WHERE id = ?').run(paypalData.id, orderId);
+
+    res.json({
+      success: true,
+      orderId,
+      paypalOrderId: paypalData.id,
+      approveUrl: paypalData.links.find(link => link.rel === 'approve')?.href,
+    });
   } catch (e) {
-    console.error('[Stripe] 创建 session 失败:', e);
+    console.error('[PayPal] 创建订单失败:', e);
     res.status(500).json({ error: '支付创建失败：' + e.message });
+  }
+});
+
+// 捕获 PayPal 订单
+app.post('/api/payment/capture-paypal-order', auth, async (req, res) => {
+  const { orderId } = req.body;
+  if (!orderId) return res.status(400).json({ error: '订单 ID 必填' });
+
+  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+  if (!order) return res.status(404).json({ error: '订单不存在' });
+  if (order.status === 'paid') return res.json({ success: true, message: '订单已到账' });
+
+  // 获取 PayPal 订单 ID
+  const paypalOrderId = order.paypal_order_id;
+  if (!paypalOrderId) return res.status(400).json({ error: 'PayPal 订单 ID 不存在' });
+
+  try {
+    const accessToken = await getPayPalAccessToken();
+    const baseUrl = process.env.PAYPAL_ENV === 'live'
+      ? 'https://api.paypal.com'
+      : 'https://api.sandbox.paypal.com';
+
+    const captureRes = await fetch(`${baseUrl}/v2/checkout/orders/${paypalOrderId}/capture`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    const captureData = await captureRes.json();
+
+    if (!captureRes.ok) {
+      console.error('[PayPal] 捕获订单失败:', captureData);
+      return res.status(500).json({ error: 'PayPal 捕获失败' });
+    }
+
+    // 更新订单状态
+    db.prepare('UPDATE orders SET status = ?, paid_at = datetime("now","localtime") WHERE id = ?').run('paid', orderId);
+    db.prepare('UPDATE users SET credits = credits + ?, total_recharged = total_recharged + ? WHERE id = ?').run(order.credits, order.credits, order.user_id);
+    db.prepare('INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, related_order_id) VALUES (?, "recharge", ?, (SELECT credits FROM users WHERE id = ?), "payment", ?, ?)').run(order.user_id, order.credits, order.user_id, `PayPal 充值-${order.package_name}`, orderId);
+
+    console.log('[PayPal] 订单已到账:', orderId, 'credits:', order.credits);
+
+    const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(order.user_id);
+    res.json({ success: true, balance: user.credits, message: '支付成功，积分已到账' });
+  } catch (e) {
+    console.error('[PayPal] 捕获订单失败:', e);
+    res.status(500).json({ error: '捕获失败：' + e.message });
   }
 });
 
@@ -476,7 +545,7 @@ app.get('/api/config/status', (req, res) => {
     payment: {
       wechat: !!(process.env.WECHAT_PAY_APP_ID),
       alipay: !!(process.env.ALIPAY_APP_ID),
-      stripe: !!(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_SECRET_KEY.length > 10),
+      paypal: !!(process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET),
     },
     version: '1.0.0',
   });
