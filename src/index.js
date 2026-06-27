@@ -104,8 +104,10 @@ if (!adminExists) {
 }
 
 // 兼容旧表：添加 PayPal 相关字段
+
 try { db.exec('ALTER TABLE orders ADD COLUMN paid_at TEXT'); } catch (e) {}
 try { db.exec('ALTER TABLE orders ADD COLUMN paypal_order_id TEXT'); } catch (e) {}
+try { db.exec('ALTER TABLE credit_transactions ADD COLUMN related_order_id TEXT'); } catch (e) {}
 
 // ===== 中间件 =====
 app.use(express.json());
