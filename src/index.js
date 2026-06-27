@@ -372,15 +372,23 @@ app.post('/api/payment/create-paypal-order', auth, async (req, res) => {
 
 // 捕获 PayPal 订单
 app.post('/api/payment/capture-paypal-order', auth, async (req, res) => {
-  const { orderId } = req.body;
-  if (!orderId) return res.status(400).json({ error: '订单 ID 必填' });
+  let { orderId, paypalOrderId } = req.body;
+  if (!orderId && !paypalOrderId) return res.status(400).json({ error: '订单 ID 必填' });
 
-  const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+  let order;
+  if (orderId) {
+    order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+  } else {
+    // 通过 PayPal 订单 ID 查找
+    order = db.prepare('SELECT * FROM orders WHERE paypal_order_id = ?').get(paypalOrderId);
+    if (order) orderId = order.id;
+  }
+
   if (!order) return res.status(404).json({ error: '订单不存在' });
   if (order.status === 'paid') return res.json({ success: true, message: '订单已到账' });
 
   // 获取 PayPal 订单 ID
-  const paypalOrderId = order.paypal_order_id;
+  paypalOrderId = order.paypal_order_id;
   if (!paypalOrderId) return res.status(400).json({ error: 'PayPal 订单 ID 不存在' });
 
   try {
@@ -534,6 +542,7 @@ app.get('/api/admin/users', auth, (req, res) => {
 
 // 系统状态（前端用来判断哪些功能可用）
 app.get('/api/config/status', (req, res) => {
+  const paypalReady = !!(process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET);
   res.json({
     mockMode: !(process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY.length > 10),
     providers: {
@@ -545,7 +554,9 @@ app.get('/api/config/status', (req, res) => {
     payment: {
       wechat: !!(process.env.WECHAT_PAY_APP_ID),
       alipay: !!(process.env.ALIPAY_APP_ID),
-      paypal: !!(process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET),
+      paypal: paypalReady,
+      paypalClientId: paypalReady ? process.env.PAYPAL_CLIENT_ID : '',
+      paypalEnv: process.env.PAYPAL_ENV || 'sandbox',
     },
     version: '1.0.0',
   });
