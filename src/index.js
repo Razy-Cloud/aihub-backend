@@ -81,6 +81,13 @@ db.exec(`
     FOREIGN KEY (session_id) REFERENCES chat_sessions(id),
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
+  CREATE TABLE IF NOT EXISTS check_in_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    check_date TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    UNIQUE(user_id, check_date)
+  );
 `);
 
 // 种子数据：管理员
@@ -286,10 +293,19 @@ app.post('/api/user/check-in', auth, (req, res) => {
   const exists = db.prepare('SELECT id FROM check_in_records WHERE user_id = ? AND check_date = ?').get(req.user.id, today);
   if (exists) return res.status(400).json({ error: '今天已签到' });
   const credits = 5;
+  db.prepare("INSERT INTO check_in_records (user_id, check_date) VALUES (?, ?)").run(req.user.id, today);
   db.prepare("UPDATE users SET credits = credits + ? WHERE id = ?").run(credits, req.user.id);
   db.prepare("INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description) VALUES (?, 'sign_in', ?, (SELECT credits FROM users WHERE id = ?), 'system', ?)").run(req.user.id, credits, req.user.id, '签到奖励');
   const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
-  res.json({ success: true, creditsEarned: credits, balance: user.credits });
+  // 计算连续签到天数
+  const records = db.prepare('SELECT check_date FROM check_in_records WHERE user_id = ? ORDER BY check_date DESC').all(req.user.id);
+  let consecutiveDays = 1;
+  for (let i = 1; i < records.length; i++) {
+    const prev = new Date(records[i-1].check_date); prev.setDate(prev.getDate()-1);
+    if (prev.toISOString().slice(0,10) === records[i].check_date) consecutiveDays++;
+    else break;
+  }
+  res.json({ success: true, creditsEarned: credits, balance: user.credits, consecutiveDays });
 });
 
 // --- 管理后台：数据看板 ---
