@@ -1,0 +1,22 @@
+# Fly.io 部署配置
+# .dockerignore - 排除不需要的文件
+
+node_modules
+node_modules/**
+*.log
+*.md
+.git
+.gitignore
+.env
+.DS_Store
+*.zip
+*.tar.gz
+build-files.js
+upload.js
+data/**
+!.dockerignore
+!Dockerfile
+!fly.toml
+!package.json
+!package-lock.json
+!src/**
