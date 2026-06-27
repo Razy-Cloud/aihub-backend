@@ -319,7 +319,61 @@ app.get('/api/admin/dashboard', auth, (req, res) => {
   res.json({ stats });
 });
 
-// --- 管理后台：用户列表 ---
+// ===== AI 绘画接口 =====
+// 使用 Pollinations 免费 API（无需 Key，生产环境建议换成 Stability AI / Replicate）
+app.post('/api/image/generate', auth, async (req, res) => {
+  const { prompt, style = 'photorealistic', size = '512x512' } = req.body;
+  if (!prompt || prompt.trim().length < 2) return res.status(400).json({ error: '请输入绘画描述' });
+
+  // 积分扣费（标准 8 积分/张）
+  const cost = 8;
+  const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
+  if (user.credits < cost) return res.status(400).json({ error: '积分不足，需要 ' + cost + ' 积分' });
+
+  try {
+    // 解析尺寸
+    const [w, h] = size.split('x').map(Number);
+    const width = w || 512;
+    const height = h || 512;
+
+    // 风格映射
+    const styleMap = {
+      photorealistic: 'flux',
+      anime: 'anime',
+      oilpainting: 'flux',
+      watercolor: 'flux',
+      cyberpunk: 'flux',
+    };
+    const model = styleMap[style] || 'flux';
+
+    // 构建 Pollinations URL
+    const encodedPrompt = encodeURIComponent(prompt.trim());
+    const imageUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=${width}&height=${height}&model=${model}&nologo=true&private=true`;
+
+    // 扣积分
+    db.prepare('UPDATE users SET credits = credits - ? WHERE id = ?').run(cost, req.user.id);
+    db.prepare(
+      "INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description) VALUES (?, 'consume', ?, (SELECT credits FROM users WHERE id = ?), 'system', ?)"
+    ).run(-cost, req.user.id, `AI绘画：${prompt.slice(0, 30)}`);
+
+    const balance = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id).credits;
+
+    res.json({
+      success: true,
+      imageUrl,
+      prompt: prompt.trim(),
+      style,
+      size,
+      cost,
+      balance,
+    });
+  } catch (e) {
+    console.error('Image generate error:', e);
+    res.status(500).json({ error: '绘画生成失败：' + e.message });
+  }
+});
+
+// ===== 管理后台：用户列表 =====
 app.get('/api/admin/users', auth, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: '无权限' });
   const users = db.prepare('SELECT id, phone, nickname, credits, role, status, created_at FROM users ORDER BY id DESC LIMIT 100').all();
@@ -334,6 +388,7 @@ app.get('/api/config/status', (req, res) => {
       deepseek: !!(process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY.length > 10),
       qwen: !!(process.env.QWEN_API_KEY && process.env.QWEN_API_KEY.length > 10),
       openai: !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 10),
+      image: true,  // Pollinations 免费 API 已接入
     },
     payment: {
       wechat: !!(process.env.WECHAT_PAY_APP_ID),
