@@ -6,11 +6,16 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
+const Stripe = require('stripe');
 
 // ===== 初始化 =====
 const app = express();
 const JWT_SECRET = process.env.JWT_SECRET || 'aihub-dev-2026';
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'aihub.db');
+const stripe = Stripe(process.env.STRIPE_SECRET_KEY || '', {
+  apiVersion: '2024-06-20',
+  appInfo: { name: 'AIHub', version: '1.0.0' },
+});
 
 // 确保数据目录
 const dbDir = path.dirname(DB_PATH);
@@ -98,7 +103,37 @@ if (!adminExists) {
   console.log('[DB] Admin created: phone=13800000000 password=admin123456');
 }
 
+// 兼容旧表：添加 Stripe 相关字段
+try { db.exec('ALTER TABLE orders ADD COLUMN paid_at TEXT'); } catch (e) {}
+try { db.exec('ALTER TABLE orders ADD COLUMN stripe_session_id TEXT'); } catch (e) {}
+
 // ===== 中间件 =====
+// Stripe Webhook 必须在 express.json() 之前，使用 raw body
+app.post('/api/payment/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET || '';
+  let event;
+  try {
+    event = endpointSecret ? stripe.webhooks.constructEvent(req.body, sig, endpointSecret) : JSON.parse(req.body);
+  } catch (err) {
+    console.error('[Stripe Webhook] 验证失败:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const orderId = session.client_reference_id;
+    if (!orderId) return res.json({ received: true });
+    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+    if (order && order.status === 'pending') {
+      db.prepare('UPDATE orders SET status = ?, paid_at = datetime("now","localtime"), stripe_session_id = ? WHERE id = ?').run('paid', session.id, orderId);
+      db.prepare('UPDATE users SET credits = credits + ?, total_recharged = total_recharged + ? WHERE id = ?').run(order.credits, order.credits, order.user_id);
+      db.prepare('INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, related_order_id) VALUES (?, "recharge", ?, (SELECT credits FROM users WHERE id = ?), "payment", ?, ?)').run(order.user_id, order.credits, order.user_id, `Stripe 充值-${order.package_name}`, orderId);
+      console.log('[Stripe Webhook] 订单已到账:', orderId, 'credits:', order.credits);
+    }
+  }
+  res.json({ received: true });
+});
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(require('cors')());
@@ -267,6 +302,54 @@ app.get('/api/payment/packages', (req, res) => {
   });
 });
 
+// --- Stripe Checkout 支付 ---
+app.post('/api/payment/create-stripe-session', auth, async (req, res) => {
+  const { packageId } = req.body;
+  const pkgMap = {
+    pkg_9: { price: 9.9, credits: 100, name: 'AIHub 体验档' },
+    pkg_29: { price: 29.9, credits: 350, name: 'AIHub 入门档' },
+    pkg_99: { price: 99, credits: 1200, name: 'AIHub 常用档' },
+    pkg_299: { price: 299, credits: 4000, name: 'AIHub 重度档' },
+  };
+  const pkg = pkgMap[packageId];
+  if (!pkg) return res.status(400).json({ error: '套餐不存在' });
+
+  if (!process.env.STRIPE_SECRET_KEY) {
+    return res.status(400).json({ error: 'Stripe 未配置，请联系管理员' });
+  }
+
+  const orderId = 'ORD' + Date.now();
+  db.prepare("INSERT INTO orders (id, user_id, package_name, amount, credits, status) VALUES (?, ?, ?, ?, ?, 'pending')").run(orderId, req.user.id, packageId, pkg.price, pkg.credits);
+
+  const successUrl = req.body.returnUrl || `${process.env.FRONTEND_URL || 'https://aihub-frontend-pyom.vercel.app'}/#/credits?paid=success&order=${orderId}`;
+  const cancelUrl = req.body.cancelUrl || `${process.env.FRONTEND_URL || 'https://aihub-frontend-pyom.vercel.app'}/#/credits?paid=cancel`;
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'cny',
+          product_data: { name: pkg.name, description: `充值 ${pkg.credits} 积分` },
+          unit_amount: Math.round(pkg.price * 100),
+        },
+        quantity: 1,
+      }],
+      mode: 'payment',
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+      client_reference_id: orderId,
+      metadata: { user_id: String(req.user.id), package_name: packageId, credits: String(pkg.credits) },
+    });
+
+    db.prepare('UPDATE orders SET stripe_session_id = ? WHERE id = ?').run(session.id, orderId);
+    res.json({ success: true, orderId, url: session.url, sessionId: session.id });
+  } catch (e) {
+    console.error('[Stripe] 创建 session 失败:', e);
+    res.status(500).json({ error: '支付创建失败：' + e.message });
+  }
+});
+
 // --- 模拟支付（直接到账）---
 app.post('/api/payment/create-order', auth, (req, res) => {
   const { packageId } = req.body;
@@ -393,6 +476,7 @@ app.get('/api/config/status', (req, res) => {
     payment: {
       wechat: !!(process.env.WECHAT_PAY_APP_ID),
       alipay: !!(process.env.ALIPAY_APP_ID),
+      stripe: !!(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_SECRET_KEY.length > 10),
     },
     version: '1.0.0',
   });
