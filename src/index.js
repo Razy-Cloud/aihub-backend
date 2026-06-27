@@ -354,7 +354,7 @@ app.post('/api/image/generate', auth, async (req, res) => {
     db.prepare('UPDATE users SET credits = credits - ? WHERE id = ?').run(cost, req.user.id);
     db.prepare(
       "INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description) VALUES (?, 'consume', ?, (SELECT credits FROM users WHERE id = ?), 'system', ?)"
-    ).run(-cost, req.user.id, `AI绘画：${prompt.slice(0, 30)}`);
+    ).run(req.user.id, -cost, req.user.id, `AI绘画：${prompt.slice(0, 30)}`);
 
     const balance = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id).credits;
 
