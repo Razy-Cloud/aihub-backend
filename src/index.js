@@ -411,7 +411,15 @@ app.post('/api/payment/capture-paypal-order', auth, async (req, res) => {
 
     if (!captureRes.ok) {
       console.error('[PayPal] 捕获订单失败:', captureData);
-      return res.status(500).json({ error: 'PayPal 捕获失败' });
+      const firstDetail = captureData?.details?.[0];
+      return res.status(500).json({
+        error: 'PayPal 捕获失败',
+        paypalStatus: captureData?.status,
+        paypalDebugId: captureData?.debug_id,
+        paypalIssue: firstDetail?.issue,
+        paypalDescription: firstDetail?.description,
+        raw: captureData,
+      });
     }
 
     // 更新订单状态
