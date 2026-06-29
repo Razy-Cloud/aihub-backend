@@ -180,7 +180,7 @@ module.exports = function setupPaymentRoutes(app, db) {
           total_amount: pkg.price.toFixed(2),
           subject: pkg.name,
         },
-      });
+      }, { timeout: 30000 });
       if (result.code !== '10000' || !result.qr_code) {
         console.error('[Alipay] 创建订单失败:', result);
         return res.status(500).json({ error: '支付宝订单创建失败：' + (result.msg || '未知错误') });
