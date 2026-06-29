@@ -32,7 +32,7 @@ function initAlipay() {
   if (!process.env.ALIPAY_APP_ID || !process.env.ALIPAY_PRIVATE_KEY) {
     return null;
   }
-  const AlipaySdk = require('alipay-sdk').default;
+  const { AlipaySdk } = require('alipay-sdk');
   return new AlipaySdk({
     appId: process.env.ALIPAY_APP_ID,
     privateKey: process.env.ALIPAY_PRIVATE_KEY.replace(/\\n/g, '\n'),
