@@ -150,7 +150,7 @@ module.exports = function setupPaymentRoutes(app, db) {
     }
   });
 
-  // 支付宝：创建电脑网站支付订单
+  // 支付宝：创建当面付（扫码）订单
   app.post('/api/payment/create-alipay-order', async (req, res) => {
     const auth = req.headers.authorization;
     if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: '未登录' });
@@ -172,19 +172,21 @@ module.exports = function setupPaymentRoutes(app, db) {
     db.prepare("INSERT INTO orders (id, user_id, package_name, amount, credits, status, payment_method) VALUES (?, ?, ?, ?, ?, 'pending', 'alipay')").run(orderId, user.id, packageId, pkg.price, pkg.credits);
 
     try {
-      const returnUrl = `${FRONTEND_URL}/#/credits?paid=success&order=${orderId}`;
       const notifyUrl = `${BACKEND_URL}/api/payment/alipay-notify`;
-      const payUrl = alipay.pageExec('alipay.trade.page.pay', 'GET', {
+      const result = await alipay.exec('alipay.trade.precreate', {
+        notifyUrl,
         bizContent: {
           out_trade_no: orderId,
           total_amount: pkg.price.toFixed(2),
           subject: pkg.name,
-          product_code: 'FAST_INSTANT_TRADE_PAY',
         },
-        notifyUrl,
-        returnUrl,
       });
-      res.json({ success: true, orderId, payUrl });
+      if (result.code !== '10000' || !result.qr_code) {
+        console.error('[Alipay] 创建订单失败:', result);
+        return res.status(500).json({ error: '支付宝订单创建失败：' + (result.msg || '未知错误') });
+      }
+      const qrDataUrl = await QRCode.toDataURL(result.qr_code, { width: 256, margin: 2 });
+      res.json({ success: true, orderId, amount: pkg.price, qrCode: result.qr_code, qrDataUrl });
     } catch (e) {
       console.error('[Alipay] 创建订单失败:', e);
       res.status(500).json({ error: '支付宝订单创建失败：' + e.message });
