@@ -151,7 +151,7 @@ module.exports = function setupPaymentRoutes(app, db) {
     }
   });
 
-  // 支付宝：创建当面付（扫码）订单
+  // 支付宝：创建网站支付订单（返回支付链接 + 二维码）
   app.post('/api/payment/create-alipay-order', async (req, res) => {
     const auth = req.headers.authorization;
     if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: '未登录' });
@@ -173,24 +173,21 @@ module.exports = function setupPaymentRoutes(app, db) {
     db.prepare("INSERT INTO orders (id, user_id, package_name, amount, credits, status, payment_method) VALUES (?, ?, ?, ?, ?, 'pending', 'alipay')").run(orderId, user.id, packageId, pkg.price, pkg.credits);
 
     try {
+      const returnUrl = `${FRONTEND_URL}/#/credits?paid=success&order=${orderId}`;
       const notifyUrl = `${BACKEND_URL}/api/payment/alipay-notify`;
-      const result = await alipay.exec('alipay.trade.precreate', {
-        notifyUrl,
+      const payUrl = alipay.pageExec('alipay.trade.page.pay', 'GET', {
         bizContent: {
           out_trade_no: orderId,
           total_amount: pkg.price.toFixed(2),
           subject: pkg.name,
+          product_code: 'FAST_INSTANT_TRADE_PAY',
         },
-      }, { timeout: 30000 });
-      console.log('[Alipay] precreate raw result:', JSON.stringify(result));
-      // alipay-sdk v4 exec 可能返回嵌套结构或扁平结构
-      const resp = result.alipay_trade_precreate_response || result;
-      if (resp.code !== '10000' || !resp.qr_code) {
-        console.error('[Alipay] 创建订单失败:', JSON.stringify(result));
-        return res.status(500).json({ error: '支付宝订单创建失败：' + (resp.msg || resp.subMsg || JSON.stringify(result)) });
-      }
-      const qrDataUrl = await QRCode.toDataURL(resp.qr_code, { width: 256, margin: 2 });
-      res.json({ success: true, orderId, amount: pkg.price, qrCode: resp.qr_code, qrDataUrl });
+        notifyUrl,
+        returnUrl,
+      });
+      // 将支付链接生成二维码，用户可扫码或点击链接
+      const qrDataUrl = await QRCode.toDataURL(payUrl, { width: 256, margin: 2 });
+      res.json({ success: true, orderId, amount: pkg.price, payUrl, qrDataUrl });
     } catch (e) {
       console.error('[Alipay] 创建订单失败:', e);
       res.status(500).json({ error: '支付宝订单创建失败：' + e.message });
