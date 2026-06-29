@@ -182,12 +182,15 @@ module.exports = function setupPaymentRoutes(app, db) {
           subject: pkg.name,
         },
       }, { timeout: 30000 });
-      if (result.code !== '10000' || !result.qr_code) {
-        console.error('[Alipay] 创建订单失败:', result);
-        return res.status(500).json({ error: '支付宝订单创建失败：' + (result.msg || '未知错误') });
+      console.log('[Alipay] precreate raw result:', JSON.stringify(result));
+      // alipay-sdk v4 exec 可能返回嵌套结构或扁平结构
+      const resp = result.alipay_trade_precreate_response || result;
+      if (resp.code !== '10000' || !resp.qr_code) {
+        console.error('[Alipay] 创建订单失败:', JSON.stringify(result));
+        return res.status(500).json({ error: '支付宝订单创建失败：' + (resp.msg || resp.subMsg || JSON.stringify(result)) });
       }
-      const qrDataUrl = await QRCode.toDataURL(result.qr_code, { width: 256, margin: 2 });
-      res.json({ success: true, orderId, amount: pkg.price, qrCode: result.qr_code, qrDataUrl });
+      const qrDataUrl = await QRCode.toDataURL(resp.qr_code, { width: 256, margin: 2 });
+      res.json({ success: true, orderId, amount: pkg.price, qrCode: resp.qr_code, qrDataUrl });
     } catch (e) {
       console.error('[Alipay] 创建订单失败:', e);
       res.status(500).json({ error: '支付宝订单创建失败：' + e.message });
