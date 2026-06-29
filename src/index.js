@@ -111,8 +111,12 @@ if (!adminExists) {
 try { db.exec('ALTER TABLE orders ADD COLUMN paid_at TEXT'); } catch (e) {}
 try { db.exec('ALTER TABLE orders ADD COLUMN paypal_order_id TEXT'); } catch (e) {}
 try { db.exec('ALTER TABLE credit_transactions ADD COLUMN related_order_id TEXT'); } catch (e) {}
+try { db.exec('ALTER TABLE orders ADD COLUMN payment_method TEXT'); } catch (e) {}
 
 // ===== 中间件 =====
+// 支付回调需要原始 body 用于验签，必须在 express.json() 之前挂载
+app.use('/api/payment/wechat-notify', express.raw({ type: 'application/json' }));
+app.use('/api/payment/alipay-notify', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(require('cors')());
@@ -460,6 +464,9 @@ app.post('/api/payment/create-order', auth, (req, res) => {
   const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
   res.json({ success: true, orderId, balance: user.credits, message: '支付成功，积分已到账（模拟）' });
 });
+
+// --- 微信支付 / 支付宝支付 ---
+require('./payment')(app, db);
 
 // --- 积分流水 ---
 app.get('/api/user/transactions', auth, (req, res) => {
