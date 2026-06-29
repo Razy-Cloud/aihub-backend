@@ -589,6 +589,32 @@ app.get('/api/config/status', (req, res) => {
   });
 });
 
+// 模型列表（根据已配置的提供商动态返回）
+const MODEL_CATALOG = [
+  // DeepSeek
+  { id: 'deepseek-chat', name: 'DeepSeek V3', provider: 'deepseek', tier: 'basic', tierLabel: '入门档', costPer1k: 2, desc: '高性价比通用大模型，适合日常对话与写作', icon: '🧠' },
+  { id: 'deepseek-coder', name: 'DeepSeek Coder', provider: 'deepseek', tier: 'advanced', tierLabel: '进阶档', costPer1k: 4, desc: '代码专用模型，支持多种编程语言', icon: '💻' },
+  { id: 'deepseek-reasoner', name: 'DeepSeek R1', provider: 'deepseek', tier: 'reasoning', tierLabel: '推理档', costPer1k: 18, desc: '深度推理模型，适合复杂数学与逻辑', icon: '🔬' },
+  // Qwen
+  { id: 'qwen-turbo', name: '通义千问 Turbo', provider: 'qwen', tier: 'basic', tierLabel: '入门档', costPer1k: 2, desc: '通义千问快速版，性价比高', icon: '🧠' },
+  { id: 'qwen-plus', name: '通义千问 Plus', provider: 'qwen', tier: 'advanced', tierLabel: '进阶档', costPer1k: 4, desc: '通义千问增强版，中文理解能力强', icon: '⚡' },
+  { id: 'qwen-max', name: '通义千问 Max', provider: 'qwen', tier: 'flagship', tierLabel: '旗舰档', costPer1k: 10, desc: '通义千问旗舰模型，能力全面', icon: '🏆' },
+  // OpenAI
+  { id: 'gpt-4o-mini', name: 'GPT-4o mini', provider: 'openai', tier: 'advanced', tierLabel: '进阶档', costPer1k: 5, desc: 'OpenAI 轻量级模型，响应快速', icon: '⚡' },
+  { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', tier: 'flagship', tierLabel: '旗舰档', costPer1k: 12, desc: 'OpenAI 旗舰多模态模型，能力全面', icon: '🏆' },
+];
+app.get('/api/models', (req, res) => {
+  const hasDeepSeek = !!(process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY.length > 10);
+  const hasQwen = !!(process.env.QWEN_API_KEY && process.env.QWEN_API_KEY.length > 10);
+  const hasOpenAI = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 10);
+  const enabledProviders = new Set();
+  if (hasDeepSeek) enabledProviders.add('deepseek');
+  if (hasQwen) enabledProviders.add('qwen');
+  if (hasOpenAI) enabledProviders.add('openai');
+  const models = MODEL_CATALOG.filter(m => enabledProviders.has(m.provider));
+  res.json({ success: true, models });
+});
+
 // 健康检查
 app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
