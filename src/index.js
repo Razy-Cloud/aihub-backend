@@ -425,10 +425,17 @@ app.post('/api/payment/capture-paypal-order', auth, async (req, res) => {
       });
     }
 
-    // 更新订单状态
-    db.prepare("UPDATE orders SET status = ?, paid_at = datetime('now','localtime') WHERE id = ?").run('paid', orderId);
-    db.prepare('UPDATE users SET credits = credits + ?, total_recharged = total_recharged + ? WHERE id = ?').run(order.credits, order.credits, order.user_id);
-    db.prepare('INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, related_order_id) VALUES (?, "recharge", ?, (SELECT credits FROM users WHERE id = ?), "payment", ?, ?)').run(order.user_id, order.credits, order.user_id, `PayPal 充值-${order.package_name}`, orderId);
+    // 更新订单状态（使用事务保证原子性）
+    const updateOrder = db.prepare("UPDATE orders SET status = ?, paid_at = datetime('now','localtime') WHERE id = ?");
+    const addCredits = db.prepare('UPDATE users SET credits = credits + ?, total_recharged = total_recharged + ? WHERE id = ?');
+    const recordTransaction = db.prepare("INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, related_order_id) VALUES (?, 'recharge', ?, (SELECT credits FROM users WHERE id = ?), 'payment', ?, ?)");
+
+    const runCapture = db.transaction((orderId, userId, credits, packageName) => {
+      updateOrder.run('paid', orderId);
+      addCredits.run(credits, credits, userId);
+      recordTransaction.run(userId, credits, userId, `PayPal 充值-${packageName}`, orderId);
+    });
+    runCapture(orderId, order.user_id, order.credits, order.package_name);
 
     console.log('[PayPal] 订单已到账:', orderId, 'credits:', order.credits);
 
