@@ -426,7 +426,7 @@ app.post('/api/payment/capture-paypal-order', auth, async (req, res) => {
     }
 
     // 更新订单状态
-    db.prepare('UPDATE orders SET status = ?, paid_at = datetime("now","localtime") WHERE id = ?').run('paid', orderId);
+    db.prepare("UPDATE orders SET status = ?, paid_at = datetime('now','localtime') WHERE id = ?").run('paid', orderId);
     db.prepare('UPDATE users SET credits = credits + ?, total_recharged = total_recharged + ? WHERE id = ?').run(order.credits, order.credits, order.user_id);
     db.prepare('INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, related_order_id) VALUES (?, "recharge", ?, (SELECT credits FROM users WHERE id = ?), "payment", ?, ?)').run(order.user_id, order.credits, order.user_id, `PayPal 充值-${order.package_name}`, orderId);
 
