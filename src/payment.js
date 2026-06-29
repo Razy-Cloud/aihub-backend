@@ -39,6 +39,7 @@ function initAlipay() {
     alipayPublicKey: process.env.ALIPAY_PUBLIC_KEY ? process.env.ALIPAY_PUBLIC_KEY.replace(/\\n/g, '\n') : undefined,
     gateway: process.env.ALIPAY_GATEWAY_URL || 'https://openapi.alipay.com/gateway.do',
     signType: 'RSA2',
+    timeout: 30000,
   });
 }
 
