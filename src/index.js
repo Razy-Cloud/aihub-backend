@@ -578,9 +578,9 @@ app.get('/api/admin/dashboard', auth, (req, res) => {
     totalOrders: db.prepare("SELECT COUNT(*) as c FROM orders WHERE status='paid'").get().c,
     totalRevenue: db.prepare("SELECT SUM(amount) as s FROM orders WHERE status='paid'").get().s || 0,
     todayRevenue: db.prepare("SELECT SUM(amount) as s FROM orders WHERE status='paid' AND date(paid_at) = date('now','localtime')").get().s || 0,
-    totalCreditsConsumed: db.prepare("SELECT SUM(amount) as s FROM credit_transactions WHERE type='consume'").get().s || 0,
+    totalCreditsConsumed: Math.abs(db.prepare("SELECT SUM(amount) as s FROM credit_transactions WHERE type='consume'").get().s) || 0,
     totalCreditsRecharged: db.prepare("SELECT SUM(amount) as s FROM credit_transactions WHERE type='recharge'").get().s || 0,
-    avgCreditsPerUser: db.prepare('SELECT ROUND(AVG(credits),1) as a FROM users').get().a || 0,
+    avgCreditsPerUser: db.prepare("SELECT ROUND(AVG(credits),1) as a FROM users WHERE role != 'admin'").get().a || 0,
   };
   // 今日新增用户
   stats.todayNewUsers = db.prepare("SELECT COUNT(*) as c FROM users WHERE date(created_at) = date('now','localtime')").get().c;
