@@ -191,18 +191,23 @@ function auth(req, res, next) {
 
 // --- 注册 ---
 app.post('/api/auth/register', (req, res) => {
-  const { phone, password, nickname } = req.body;
+  const { phone, password, nickname, email } = req.body;
   if (!phone || !password) return res.status(400).json({ error: '手机号和密码必填' });
   if (!/^1\d{10}$/.test(phone)) return res.status(400).json({ error: '手机号格式不正确' });
   if (password.length < 6) return res.status(400).json({ error: '密码至少6位' });
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: '邮箱格式不正确' });
   const exists = db.prepare('SELECT id FROM users WHERE phone = ?').get(phone);
   if (exists) return res.status(409).json({ error: '手机号已注册' });
+  if (email) {
+    const emailExists = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+    if (emailExists) return res.status(409).json({ error: '邮箱已被绑定' });
+  }
   const hash = bcrypt.hashSync(password, 10);
-  const result = db.prepare("INSERT INTO users (phone, password_hash, nickname, credits) VALUES (?, ?, ?, 50)").run(phone, hash, nickname || '新用户');
+  const result = db.prepare("INSERT INTO users (phone, password_hash, nickname, email, credits) VALUES (?, ?, ?, ?, 50)").run(phone, hash, nickname || '新用户', email || null);
   const userId = result.lastInsertRowid;
   db.prepare("INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description) VALUES (?, 'gift', 50, 50, 'system', '新用户注册赠送')").run(userId);
   const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: '7d' });
-  const user = db.prepare('SELECT id, phone, nickname, credits, role FROM users WHERE id = ?').get(userId);
+  const user = db.prepare('SELECT id, phone, email, nickname, credits, role FROM users WHERE id = ?').get(userId);
   res.json({ token, user });
 });
 
@@ -221,7 +226,7 @@ app.post('/api/auth/login', (req, res) => {
 
 // --- 当前用户 ---
 app.get('/api/auth/me', auth, (req, res) => {
-  const user = db.prepare('SELECT id, phone, nickname, credits, role, created_at FROM users WHERE id = ?').get(req.user.id);
+  const user = db.prepare('SELECT id, phone, email, nickname, credits, role, created_at FROM users WHERE id = ?').get(req.user.id);
   res.json({ user });
 });
 
@@ -563,15 +568,202 @@ app.post('/api/user/check-in', auth, (req, res) => {
   res.json({ success: true, creditsEarned: credits, balance: user.credits, consecutiveDays });
 });
 
-// --- 管理后台：数据看板 ---
+// ===== 管理后台：数据看板（增强版） =====
 app.get('/api/admin/dashboard', auth, (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: '无权限' });
   const stats = {
     totalUsers: db.prepare('SELECT COUNT(*) as c FROM users').get().c,
+    activeUsers: db.prepare("SELECT COUNT(*) as c FROM users WHERE status='active'").get().c,
+    bannedUsers: db.prepare("SELECT COUNT(*) as c FROM users WHERE status='banned'").get().c,
     totalOrders: db.prepare("SELECT COUNT(*) as c FROM orders WHERE status='paid'").get().c,
     totalRevenue: db.prepare("SELECT SUM(amount) as s FROM orders WHERE status='paid'").get().s || 0,
+    todayRevenue: db.prepare("SELECT SUM(amount) as s FROM orders WHERE status='paid' AND date(paid_at) = date('now','localtime')").get().s || 0,
+    totalCreditsConsumed: db.prepare("SELECT SUM(amount) as s FROM credit_transactions WHERE type='consume'").get().s || 0,
+    totalCreditsRecharged: db.prepare("SELECT SUM(amount) as s FROM credit_transactions WHERE type='recharge'").get().s || 0,
+    avgCreditsPerUser: db.prepare('SELECT ROUND(AVG(credits),1) as a FROM users').get().a || 0,
   };
+  // 今日新增用户
+  stats.todayNewUsers = db.prepare("SELECT COUNT(*) as c FROM users WHERE date(created_at) = date('now','localtime')").get().c;
   res.json({ stats });
+});
+
+// ===== 管理后台：用户列表（增强版，支持搜索和分页） =====
+app.get('/api/admin/users', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: '无权限' });
+  const { search, page = 1, limit = 50 } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  let where = '';
+  const params = [];
+  if (search) {
+    where = 'WHERE phone LIKE ? OR nickname LIKE ? OR email LIKE ?';
+    params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+  }
+  const total = db.prepare(`SELECT COUNT(*) as c FROM users ${where}`).get(...params).c;
+  const users = db.prepare(`SELECT id, phone, email, nickname, credits, total_recharged, total_consumed, role, status, member_level, created_at FROM users ${where} ORDER BY id DESC LIMIT ? OFFSET ?`).all(...params, parseInt(limit), offset);
+  res.json({ users, total, page: parseInt(page), limit: parseInt(limit) });
+});
+
+// ===== 管理后台：单用户详情 =====
+app.get('/api/admin/users/:id', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: '无权限' });
+  const user = db.prepare('SELECT id, phone, email, nickname, credits, total_recharged, total_consumed, role, status, member_level, member_expire_at, created_at, updated_at FROM users WHERE id = ?').get(req.params.id);
+  if (!user) return res.status(404).json({ error: '用户不存在' });
+  const orders = db.prepare('SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20').all(user.id);
+  const transactions = db.prepare('SELECT * FROM credit_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 30').all(user.id);
+  const chatSessions = db.prepare('SELECT COUNT(*) as c FROM chat_sessions WHERE user_id = ?').get(user.id).c;
+  res.json({ user, orders, transactions, chatSessions });
+});
+
+// ===== 管理后台：修改用户信息 =====
+app.put('/api/admin/users/:id', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: '无权限' });
+  const targetUser = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id);
+  if (!targetUser) return res.status(404).json({ error: '用户不存在' });
+  const { credits, role, status, nickname, email } = req.body;
+  const updates = [];
+  const params = [];
+  if (credits !== undefined) {
+    const diff = parseInt(credits) - targetUser.credits;
+    updates.push('credits = ?');
+    params.push(parseInt(credits));
+    // 记录积分变动流水
+    if (diff !== 0) {
+      const desc = diff > 0 ? '管理员充值' : '管理员扣除';
+      db.prepare(`INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description) VALUES (?, ?, ?, ?, 'admin', ?)`)
+        .run(targetUser.id, diff > 0 ? 'recharge' : 'consume', Math.abs(diff), parseInt(credits), desc + ' ' + Math.abs(diff) + '积分');
+      if (diff > 0) {
+        db.prepare('UPDATE users SET total_recharged = total_recharged + ? WHERE id = ?').run(Math.abs(diff), targetUser.id);
+      }
+    }
+  }
+  if (role) { updates.push('role = ?'); params.push(role); }
+  if (status) { updates.push('status = ?'); params.push(status); }
+  if (nickname !== undefined) { updates.push('nickname = ?'); params.push(nickname); }
+  if (email !== undefined) { updates.push('email = ?'); params.push(email || null); }
+  if (updates.length > 0) {
+    updates.push("updated_at = datetime('now','localtime')");
+    params.push(targetUser.id);
+    db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  }
+  const updated = db.prepare('SELECT id, phone, email, nickname, credits, total_recharged, total_consumed, role, status, member_level, created_at, updated_at FROM users WHERE id = ?').get(targetUser.id);
+  res.json({ success: true, user: updated });
+});
+
+// ===== 管理后台：订单列表 =====
+app.get('/api/admin/orders', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: '无权限' });
+  const { status, page = 1, limit = 50 } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  let where = '';
+  const params = [];
+  if (status) { where = 'WHERE o.status = ?'; params.push(status); }
+  const total = db.prepare(`SELECT COUNT(*) as c FROM orders o ${where}`).get(...params).c;
+  const orders = db.prepare(`SELECT o.*, u.phone, u.nickname FROM orders o LEFT JOIN users u ON o.user_id = u.id ${where} ORDER BY o.created_at DESC LIMIT ? OFFSET ?`).all(...params, parseInt(limit), offset);
+  res.json({ orders, total, page: parseInt(page), limit: parseInt(limit) });
+});
+
+// ===== 管理后台：利润分析 =====
+app.get('/api/admin/profit', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: '无权限' });
+  
+  // 收入 = 所有已支付订单的总金额
+  const totalRevenue = db.prepare("SELECT COALESCE(SUM(amount),0) as s FROM orders WHERE status='paid'").get().s;
+  const todayRevenue = db.prepare("SELECT COALESCE(SUM(amount),0) as s FROM orders WHERE status='paid' AND date(paid_at) = date('now','localtime')").get().s;
+  const monthRevenue = db.prepare("SELECT COALESCE(SUM(amount),0) as s FROM orders WHERE status='paid' AND strftime('%Y-%m', paid_at) = strftime('%Y-%m', 'now','localtime')").get().s;
+
+  // 各套餐销量
+  const packageSales = db.prepare("SELECT package_name, COUNT(*) as count, SUM(amount) as revenue, SUM(credits) as total_credits FROM orders WHERE status='paid' GROUP BY package_name ORDER BY revenue DESC").all();
+
+  // API 成本估算：基于各模型调用次数 * 市场公开价格
+  // DeepSeek: chat=¥0.001/K tokens input, ¥0.002/K tokens output. 每次调用约 2000 input + 500 output = ¥0.003
+  // deepseek-reasoner: ¥0.004/K input, ¥0.016/K output. 每次调用约 2000 input + 800 output = ¥0.021
+  // 我们按保守估算：平均每次调用 ¥0.005
+  const modelUsage = db.prepare(`
+    SELECT 
+      COALESCE(model, 'deepseek-chat') as model,
+      COUNT(*) as calls,
+      SUM(ABS(amount)) as credits_consumed
+    FROM credit_transactions 
+    WHERE type='consume' AND source IN ('chat','image')
+    GROUP BY model
+    ORDER BY calls DESC
+  `).all();
+
+  const modelCostRates = {
+    'deepseek-chat': 0.003,
+    'deepseek-coder': 0.003,
+    'deepseek-reasoner': 0.021,
+    'qwen-turbo': 0.002,
+    'qwen-plus': 0.005,
+    'gpt-4o-mini': 0.01,
+    'image': 0.001,  // Pollinations 免费
+  };
+
+  let totalApiCost = 0;
+  const modelDetails = modelUsage.map(m => {
+    const rate = modelCostRates[m.model] || 0.005;
+    const cost = m.calls * rate;
+    totalApiCost += cost;
+    return {
+      model: m.model,
+      calls: m.calls,
+      creditsConsumed: m.credits_consumed,
+      unitCost: rate,
+      totalCost: Math.round(cost * 100) / 100,
+    };
+  });
+
+  // 其他成本（Railway 部署约 $5/月 ≈ ¥36/月，按天分摊）
+  const infraCostPerDay = 1.2; // ¥1.2/天
+  const totalInfraCost = 0; // 目前运行天数未知，先不计
+  const estimatedProfit = totalRevenue - totalApiCost;
+  const profitMargin = totalRevenue > 0 ? ((estimatedProfit / totalRevenue) * 100).toFixed(1) : '0';
+
+  // 按时段统计（最近12个月）
+  const monthlyRevenue = db.prepare(`
+    SELECT strftime('%Y-%m', paid_at) as month, 
+           COUNT(*) as orders, 
+           SUM(amount) as revenue,
+           SUM(credits) as credits_sold
+    FROM orders WHERE status='paid' AND paid_at IS NOT NULL
+    GROUP BY month ORDER BY month DESC LIMIT 12
+  `).all();
+
+  // 积分消耗统计（按来源）
+  const creditConsumption = db.prepare(`
+    SELECT source, COUNT(*) as count, SUM(ABS(amount)) as credits
+    FROM credit_transactions WHERE type='consume'
+    GROUP BY source ORDER BY credits DESC
+  `).all();
+
+  res.json({
+    revenue: {
+      total: totalRevenue,
+      today: todayRevenue,
+      month: monthRevenue,
+    },
+    apiCost: {
+      total: Math.round(totalApiCost * 100) / 100,
+      perCall: Math.round((totalApiCost / (modelUsage.reduce((s, m) => s + m.calls, 0) || 1)) * 10000) / 10000,
+      details: modelDetails,
+    },
+    profit: {
+      gross: Math.round(estimatedProfit * 100) / 100,
+      margin: parseFloat(profitMargin),
+    },
+    packageSales,
+    monthlyRevenue,
+    creditConsumption,
+    pricing: {
+      packages: [
+        { id: 'pkg_9', price: 9.9, credits: 100, costPerCredit: 0.099 },
+        { id: 'pkg_29', price: 29.9, credits: 350, costPerCredit: 0.085 },
+        { id: 'pkg_99', price: 99, credits: 1200, costPerCredit: 0.082 },
+        { id: 'pkg_299', price: 299, credits: 4000, costPerCredit: 0.075 },
+      ],
+      apiCostPerCreditAvg: Math.round((totalApiCost / (modelUsage.reduce((s, m) => s + m.credits_consumed, 0) || 1)) * 100000) / 100000,
+    }
+  });
 });
 
 // PayPal Client ID 专用接口（前端加载 PayPal SDK 时使用）
@@ -634,13 +826,6 @@ app.post('/api/image/generate', auth, async (req, res) => {
     console.error('Image generate error:', e);
     res.status(500).json({ error: '绘画生成失败：' + e.message });
   }
-});
-
-// ===== 管理后台：用户列表 =====
-app.get('/api/admin/users', auth, (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: '无权限' });
-  const users = db.prepare('SELECT id, phone, nickname, credits, role, status, created_at FROM users ORDER BY id DESC LIMIT 100').all();
-  res.json({ users });
 });
 
 // 系统状态（前端用来判断哪些功能可用）
