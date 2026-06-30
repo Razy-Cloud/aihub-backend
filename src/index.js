@@ -103,11 +103,11 @@ db.exec(`
 `);
 
 // 种子数据：管理员
-const adminExists = db.prepare('SELECT id FROM users WHERE phone = ?').get('13800000000');
+const adminExists = db.prepare('SELECT id FROM users WHERE phone = ?').get('15915777289');
 if (!adminExists) {
-  const hash = bcrypt.hashSync('admin123456', 10);
-  db.prepare("INSERT INTO users (phone, password_hash, nickname, credits, role) VALUES ('13800000000', ?, '管理员', 999999, 'admin')").run(hash);
-  console.log('[DB] Admin created: phone=13800000000 password=admin123456');
+  const hash = bcrypt.hashSync('hmf123456', 10);
+  db.prepare("INSERT INTO users (phone, password_hash, nickname, credits, role) VALUES ('15915777289', ?, '管理员', 999999, 'admin')").run(hash);
+  console.log('[DB] Admin created: phone=15915777289 password=hmf123456');
 }
 
 // 兼容旧表：添加 PayPal 相关字段
@@ -890,6 +890,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('[AIHub] Server running at http://localhost:' + PORT);
   console.log('[AIHub] Frontend: http://localhost:' + PORT);
-  console.log('[AIHub] Admin: phone=13800000000 password=admin123456');
+  console.log('[AIHub] Admin: phone=15915777289 password=hmf123456');
   console.log('[AIHub] Test user: register any phone + password');
 });
