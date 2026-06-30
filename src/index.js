@@ -9,7 +9,11 @@ const { v4: uuidv4 } = require('uuid');
 
 // ===== 初始化 =====
 const app = express();
-const JWT_SECRET = process.env.JWT_SECRET || 'aihub-dev-2026';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('[CRITICAL] JWT_SECRET 未设置！请配置环境变量后重启。');
+  process.exit(1);
+}
 // 持久化路径：优先使用 DB_PATH；在 Railway 环境默认使用 /data/aihub.db，便于挂载 Railway Volume
 const DB_PATH = process.env.DB_PATH || (process.env.RAILWAY_ENVIRONMENT_NAME ? '/data/aihub.db' : path.join(__dirname, 'data', 'aihub.db'));
 
@@ -65,7 +69,7 @@ db.exec(`
     package_name TEXT,
     amount REAL NOT NULL,
     credits INTEGER NOT NULL,
-    status TEXT DEFAULT 'paid',
+    status TEXT DEFAULT 'pending',
     created_at TEXT DEFAULT (datetime('now','localtime')),
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
@@ -113,13 +117,56 @@ try { db.exec('ALTER TABLE orders ADD COLUMN paypal_order_id TEXT'); } catch (e)
 try { db.exec('ALTER TABLE credit_transactions ADD COLUMN related_order_id TEXT'); } catch (e) {}
 try { db.exec('ALTER TABLE orders ADD COLUMN payment_method TEXT'); } catch (e) {}
 
+// 创建高频查询索引
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_credit_transactions_user_id ON credit_transactions(user_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);
+  CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id ON chat_sessions(user_id);
+  CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id);
+`);
+
 // ===== 中间件 =====
 // 支付回调需要原始 body 用于验签，必须在 express.json() 之前挂载
 app.use('/api/payment/wechat-notify', express.raw({ type: 'application/json' }));
 app.use('/api/payment/alipay-notify', express.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(require('cors')());
+// CORS: 限制为前端域名
+app.use(require('cors')({
+  origin: [
+    'https://aihub-frontend-alpha.vercel.app',
+    'https://aihub-frontend-pyom.vercel.app',
+    process.env.FRONTEND_URL,
+    'http://localhost:3000',
+    'http://localhost:3001',
+  ].filter(Boolean),
+  credentials: true,
+}));
+
+// 速率限制（简易版，生产环境建议使用 express-rate-limit）
+const rateLimiter = (maxRequests, windowMs) => {
+  const hits = new Map();
+  return (req, res, next) => {
+    const key = req.ip || req.connection.remoteAddress;
+    const now = Date.now();
+    const record = hits.get(key) || { count: 0, start: now };
+    if (now - record.start > windowMs) { record.count = 0; record.start = now; }
+    record.count++;
+    hits.set(key, record);
+    if (record.count > maxRequests) {
+      return res.status(429).json({ error: '请求过于频繁，请稍后再试' });
+    }
+    // 清理过期记录（避免内存泄漏）
+    if (hits.size > 10000) {
+      for (const [k, v] of hits) { if (now - v.start > windowMs) hits.delete(k); }
+    }
+    next();
+  };
+};
+
+app.use('/api/auth/register', rateLimiter(5, 60000));  // 注册：每分钟5次
+app.use('/api/auth/login', rateLimiter(10, 60000));     // 登录：每分钟10次
+app.use('/api/user/check-in', rateLimiter(3, 60000));   // 签到：每分钟3次
 
 // 静态文件：前端页面
 app.use(express.static(path.join(__dirname, '..')));
@@ -146,6 +193,8 @@ function auth(req, res, next) {
 app.post('/api/auth/register', (req, res) => {
   const { phone, password, nickname } = req.body;
   if (!phone || !password) return res.status(400).json({ error: '手机号和密码必填' });
+  if (!/^1\d{10}$/.test(phone)) return res.status(400).json({ error: '手机号格式不正确' });
+  if (password.length < 6) return res.status(400).json({ error: '密码至少6位' });
   const exists = db.prepare('SELECT id FROM users WHERE phone = ?').get(phone);
   if (exists) return res.status(409).json({ error: '手机号已注册' });
   const hash = bcrypt.hashSync(password, 10);
@@ -205,6 +254,19 @@ app.post('/api/chat/stream', auth, async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 
+  // SSE 流中断时返还积分
+  let streamClosed = false;
+  let creditsRefunded = false;
+  req.on('close', () => {
+    streamClosed = true;
+    // 如果流在完成前关闭且积分未返还，则返还
+    if (!creditsRefunded) {
+      db.prepare("UPDATE users SET credits = credits + ? WHERE id = ?").run(estCost, req.user.id);
+      db.prepare("INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'refund', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)").run(req.user.id, estCost, req.user.id, '流中断返还-' + (model || 'deepseek-chat'), model || 'deepseek-chat');
+      console.log('[Chat] Stream closed, credits refunded:', estCost, 'userId:', req.user.id);
+    }
+  });
+
   try {
     const apiKey = process.env.DEEPSEEK_API_KEY;
     const baseUrl = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1';
@@ -223,9 +285,9 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 
     if (!apiRes.ok) {
       const errText = await apiRes.text();
-      // 返还积分
+      // 返还积分（使用 refund 类型记录，而非 DELETE）
       db.prepare("UPDATE users SET credits = credits + ? WHERE id = ?").run(estCost, req.user.id);
-      db.prepare("DELETE FROM credit_transactions WHERE user_id = ? AND type = 'consume' ORDER BY id DESC LIMIT 1").run(req.user.id);
+      db.prepare("INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'refund', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)").run(req.user.id, estCost, req.user.id, '对话失败返还-' + (model || 'deepseek-chat'), model || 'deepseek-chat');
       res.write('data: ' + JSON.stringify({ type: 'error', error: 'API错误: ' + apiRes.status + ' ' + errText.slice(0, 300) }) + '\n\n');
       res.end();
       return;
@@ -246,6 +308,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         if (!trimmed.startsWith('data: ')) continue;
         const dataStr = trimmed.slice(6);
         if (dataStr === '[DONE]') {
+          creditsRefunded = true; // 正常完成，标记积分已消费（不需要返还）
           const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
           res.write('data: ' + JSON.stringify({ type: 'done', cost: estCost, balance: user.credits }) + '\n\n');
           res.end();
@@ -260,14 +323,16 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         } catch (e) {}
       }
     }
+    creditsRefunded = true; // 正常完成流读取，标记积分已消费
     const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
     res.write('data: ' + JSON.stringify({ type: 'done', cost: estCost, balance: user.credits }) + '\n\n');
     res.end();
   } catch (e) {
     console.error('[Chat] Error:', e.message);
-    // 返还积分
+    creditsRefunded = true; // catch 中已返还，标记防止 close 重复返还
+    // 返还积分（使用 refund 类型记录，而非 DELETE）
     db.prepare("UPDATE users SET credits = credits + ? WHERE id = ?").run(estCost, req.user.id);
-    db.prepare("DELETE FROM credit_transactions WHERE user_id = ? AND type = 'consume' ORDER BY id DESC LIMIT 1").run(req.user.id);
+    db.prepare("INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'refund', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)").run(req.user.id, estCost, req.user.id, '对话异常返还-' + (model || 'deepseek-chat'), model || 'deepseek-chat');
     res.write('data: ' + JSON.stringify({ type: 'error', error: '对话失败: ' + e.message }) + '\n\n');
     res.end();
   }
@@ -351,8 +416,8 @@ app.post('/api/payment/create-paypal-order', auth, async (req, res) => {
           description: `充值 ${pkg.credits} 积分`,
         }],
         application_context: {
-          return_url: `${process.env.FRONTEND_URL || 'https://aihub-frontend-pyom.vercel.app'}/#/credits?paid=success&order=${orderId}`,
-          cancel_url: `${process.env.FRONTEND_URL || 'https://aihub-frontend-pyom.vercel.app'}/#/credits?paid=cancel`,
+          return_url: `${process.env.FRONTEND_URL || 'https://aihub-frontend-alpha.vercel.app'}/#/credits?paid=success&order=${orderId}`,
+          cancel_url: `${process.env.FRONTEND_URL || 'https://aihub-frontend-alpha.vercel.app'}/#/credits?paid=cancel`,
         },
       }),
     });
@@ -451,8 +516,11 @@ app.post('/api/payment/capture-paypal-order', auth, async (req, res) => {
   }
 });
 
-// --- 模拟支付（直接到账）---
+// --- 模拟支付（仅开发环境可用）---
 app.post('/api/payment/create-order', auth, (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(403).json({ error: '生产环境不可使用模拟支付' });
+  }
   const { packageId } = req.body;
   const pkgMap = { pkg_9: { price: 9.9, credits: 100 }, pkg_29: { price: 29.9, credits: 350 }, pkg_99: { price: 99, credits: 1200 }, pkg_299: { price: 299, credits: 4000 } };
   const pkg = pkgMap[packageId];
@@ -504,6 +572,14 @@ app.get('/api/admin/dashboard', auth, (req, res) => {
     totalRevenue: db.prepare("SELECT SUM(amount) as s FROM orders WHERE status='paid'").get().s || 0,
   };
   res.json({ stats });
+});
+
+// PayPal Client ID 专用接口（前端加载 PayPal SDK 时使用）
+app.get('/api/payment/paypal-config', (req, res) => {
+  if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
+    return res.status(400).json({ error: 'PayPal 未配置' });
+  }
+  res.json({ clientId: PAYPAL_CLIENT_ID, env: PAYPAL_ENV });
 });
 
 // ===== AI 绘画接口 =====
@@ -582,8 +658,8 @@ app.get('/api/config/status', (req, res) => {
       wechat: !!(process.env.WECHAT_PAY_APP_ID),
       alipay: !!(process.env.ALIPAY_APP_ID),
       paypal: paypalReady,
-      paypalClientId: paypalReady ? process.env.PAYPAL_CLIENT_ID : '',
       paypalEnv: process.env.PAYPAL_ENV || 'sandbox',
+      mock: process.env.NODE_ENV !== 'production', // 仅开发环境可使用模拟支付
     },
     version: '1.0.0',
   });
@@ -617,6 +693,12 @@ app.get('/api/models', (req, res) => {
 
 // 健康检查
 app.get('/api/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+
+// 全局错误处理中间件
+app.use((err, req, res, next) => {
+  console.error('[Error] Unhandled:', err.message);
+  res.status(500).json({ error: '服务器内部错误' });
+});
 
 // 启动
 const PORT = process.env.PORT || 3000;
