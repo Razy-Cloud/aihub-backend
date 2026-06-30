@@ -47,8 +47,8 @@ module.exports = {
 
   // 管理员
   admin: {
-    phone: process.env.ADMIN_PHONE || '13800000000',
-    password: process.env.ADMIN_PASSWORD || 'admin123456',
+    phone: process.env.ADMIN_PHONE || '15915777289',
+    password: process.env.ADMIN_PASSWORD || 'hmf123456',
   },
 
   // 积分充值套餐
