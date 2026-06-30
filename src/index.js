@@ -247,30 +247,11 @@ app.post('/api/chat/stream', auth, async (req, res) => {
     return res.status(402).json({ error: '积分不足', code: 'INSUFFICIENT_CREDITS' });
   }
 
-  // 先扣积分
-  db.prepare("UPDATE users SET credits = credits - ?, total_consumed = total_consumed + ? WHERE id = ?").run(estCost, estCost, req.user.id);
-  db.prepare(
-    "INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'consume', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)"
-  ).run(req.user.id, -estCost, req.user.id, 'AI对话-' + (model || 'deepseek-chat'), model || 'deepseek-chat');
-
-  // SSE 头
+  // 设置 SSE 头
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
-
-  // SSE 流中断时返还积分
-  let streamClosed = false;
-  let creditsRefunded = false;
-  req.on('close', () => {
-    streamClosed = true;
-    // 如果流在完成前关闭且积分未返还，则返还
-    if (!creditsRefunded) {
-      db.prepare("UPDATE users SET credits = credits + ? WHERE id = ?").run(estCost, req.user.id);
-      db.prepare("INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'refund', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)").run(req.user.id, estCost, req.user.id, '流中断返还-' + (model || 'deepseek-chat'), model || 'deepseek-chat');
-      console.log('[Chat] Stream closed, credits refunded:', estCost, 'userId:', req.user.id);
-    }
-  });
 
   try {
     const apiKey = process.env.DEEPSEEK_API_KEY;
@@ -290,9 +271,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
 
     if (!apiRes.ok) {
       const errText = await apiRes.text();
-      // 返还积分（使用 refund 类型记录，而非 DELETE）
-      db.prepare("UPDATE users SET credits = credits + ? WHERE id = ?").run(estCost, req.user.id);
-      db.prepare("INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'refund', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)").run(req.user.id, estCost, req.user.id, '对话失败返还-' + (model || 'deepseek-chat'), model || 'deepseek-chat');
+      // API 调用失败，不扣积分
       res.write('data: ' + JSON.stringify({ type: 'error', error: 'API错误: ' + apiRes.status + ' ' + errText.slice(0, 300) }) + '\n\n');
       res.end();
       return;
@@ -313,7 +292,11 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         if (!trimmed.startsWith('data: ')) continue;
         const dataStr = trimmed.slice(6);
         if (dataStr === '[DONE]') {
-          creditsRefunded = true; // 正常完成，标记积分已消费（不需要返还）
+          // 对话正常完成，扣除积分
+          db.prepare("UPDATE users SET credits = credits - ?, total_consumed = total_consumed + ? WHERE id = ? AND credits >= ?").run(estCost, estCost, req.user.id, estCost);
+          db.prepare(
+            "INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'consume', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)"
+          ).run(req.user.id, -estCost, req.user.id, 'AI对话-' + (model || 'deepseek-chat'), model || 'deepseek-chat');
           const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
           res.write('data: ' + JSON.stringify({ type: 'done', cost: estCost, balance: user.credits }) + '\n\n');
           res.end();
@@ -328,16 +311,17 @@ app.post('/api/chat/stream', auth, async (req, res) => {
         } catch (e) {}
       }
     }
-    creditsRefunded = true; // 正常完成流读取，标记积分已消费
+    // 流读取完成，扣除积分
+    db.prepare("UPDATE users SET credits = credits - ?, total_consumed = total_consumed + ? WHERE id = ? AND credits >= ?").run(estCost, estCost, req.user.id, estCost);
+    db.prepare(
+      "INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'consume', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)"
+    ).run(req.user.id, -estCost, req.user.id, 'AI对话-' + (model || 'deepseek-chat'), model || 'deepseek-chat');
     const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
     res.write('data: ' + JSON.stringify({ type: 'done', cost: estCost, balance: user.credits }) + '\n\n');
     res.end();
   } catch (e) {
     console.error('[Chat] Error:', e.message);
-    creditsRefunded = true; // catch 中已返还，标记防止 close 重复返还
-    // 返还积分（使用 refund 类型记录，而非 DELETE）
-    db.prepare("UPDATE users SET credits = credits + ? WHERE id = ?").run(estCost, req.user.id);
-    db.prepare("INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'refund', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)").run(req.user.id, estCost, req.user.id, '对话异常返还-' + (model || 'deepseek-chat'), model || 'deepseek-chat');
+    // 异常不扣积分
     res.write('data: ' + JSON.stringify({ type: 'error', error: '对话失败: ' + e.message }) + '\n\n');
     res.end();
   }
