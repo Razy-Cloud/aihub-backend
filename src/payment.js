@@ -2,8 +2,12 @@ const crypto = require('crypto');
 const QRCode = require('qrcode');
 
 // 支付相关配置
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://aihub-frontend-pyom.vercel.app';
-const BACKEND_URL = process.env.BACKEND_URL || FRONTEND_URL; // 回调必须使用后端地址
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://aihub-frontend-alpha.vercel.app';
+const BACKEND_URL = process.env.BACKEND_URL || 'https://aihub-backend-app-production.up.railway.app';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('[CRITICAL] payment.js: JWT_SECRET 未设置！');
+}
 
 const pkgMap = {
   pkg_9: { price: 9.9, credits: 100, name: 'AIHub 体验档' },
@@ -75,12 +79,10 @@ module.exports = function setupPaymentRoutes(app, db) {
   app.post('/api/payment/create-wechat-order', async (req, res) => {
     const auth = req.headers.authorization;
     if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: '未登录' });
-    const jwt = require('jsonwebtoken');
-    const JWT_SECRET = process.env.JWT_SECRET || 'aihub-dev-2026';
+    const jwtLib = require('jsonwebtoken');
     let user;
     try {
-      const d = jwt.verify(auth.slice(7), JWT_SECRET);
-      user = db.prepare('SELECT * FROM users WHERE id = ?').get(d.userId);
+      const d = jwtLib.verify(auth.slice(7), JWT_SECRET);      user = db.prepare('SELECT * FROM users WHERE id = ?').get(d.userId);
     } catch (e) { return res.status(401).json({ error: '登录已过期' }); }
     if (!user) return res.status(401).json({ error: '用户不存在' });
 
@@ -155,12 +157,10 @@ module.exports = function setupPaymentRoutes(app, db) {
   app.post('/api/payment/create-alipay-order', async (req, res) => {
     const auth = req.headers.authorization;
     if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: '未登录' });
-    const jwt = require('jsonwebtoken');
-    const JWT_SECRET = process.env.JWT_SECRET || 'aihub-dev-2026';
+    const jwtLib = require('jsonwebtoken');
     let user;
     try {
-      const d = jwt.verify(auth.slice(7), JWT_SECRET);
-      user = db.prepare('SELECT * FROM users WHERE id = ?').get(d.userId);
+      const d = jwtLib.verify(auth.slice(7), JWT_SECRET);      user = db.prepare('SELECT * FROM users WHERE id = ?').get(d.userId);
     } catch (e) { return res.status(401).json({ error: '登录已过期' }); }
     if (!user) return res.status(401).json({ error: '用户不存在' });
 
@@ -208,8 +208,30 @@ module.exports = function setupPaymentRoutes(app, db) {
       }
       const orderId = req.body.out_trade_no;
       const tradeStatus = req.body.trade_status;
+      const totalAmount = parseFloat(req.body.total_amount || '0');
+
+      // 金额校验：验证回调金额与订单金额一致
+      const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+      if (!order) {
+        console.error('[Alipay] 回调订单不存在:', orderId);
+        return res.send('fail');
+      }
+      if (Math.abs(totalAmount - order.amount) > 0.01) {
+        console.error('[Alipay] 金额不匹配: 回调', totalAmount, '订单', order.amount);
+        return res.send('fail');
+      }
+      // app_id 校验：验证通知来自本商户
+      if (req.body.app_id && req.body.app_id !== process.env.ALIPAY_APP_ID) {
+        console.error('[Alipay] app_id 不匹配:', req.body.app_id);
+        return res.send('fail');
+      }
+
       if (tradeStatus === 'TRADE_SUCCESS' || tradeStatus === 'TRADE_FINISHED') {
-        fulfillOrder(orderId, '支付宝');
+        const result = fulfillOrder(orderId, '支付宝');
+        // 无论是否重复通知，都返回 success 让支付宝停止重试
+        console.log('[Alipay] 回调处理:', result.alreadyPaid ? '重复通知(已到账)' : '首次到账', orderId);
+      } else if (tradeStatus === 'TRADE_CLOSED') {
+        console.log('[Alipay] 交易关闭:', orderId);
       }
       res.send('success');
     } catch (e) {
@@ -222,12 +244,10 @@ module.exports = function setupPaymentRoutes(app, db) {
   app.get('/api/payment/order-status', async (req, res) => {
     const auth = req.headers.authorization;
     if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: '未登录' });
-    const jwt = require('jsonwebtoken');
-    const JWT_SECRET = process.env.JWT_SECRET || 'aihub-dev-2026';
+    const jwtLib = require('jsonwebtoken');
     let user;
     try {
-      const d = jwt.verify(auth.slice(7), JWT_SECRET);
-      user = db.prepare('SELECT * FROM users WHERE id = ?').get(d.userId);
+      const d = jwtLib.verify(auth.slice(7), JWT_SECRET);      user = db.prepare('SELECT * FROM users WHERE id = ?').get(d.userId);
     } catch (e) { return res.status(401).json({ error: '登录已过期' }); }
     if (!user) return res.status(401).json({ error: '用户不存在' });
 
