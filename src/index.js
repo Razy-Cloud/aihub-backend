@@ -6,6 +6,8 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
+const llmService = require('./services/llm.service');
+const config = require('./config');
 
 // ===== 初始化 =====
 const app = express();
@@ -224,21 +226,26 @@ app.get('/api/auth/me', auth, (req, res) => {
   res.json({ user });
 });
 
-// --- 真实对话（SSE流式，接入 DeepSeek API）---
+// --- 真实对话（SSE流式，多Provider路由 + 差异化计费）---
 app.post('/api/chat/stream', auth, async (req, res) => {
   const { message, model } = req.body;
   if (!message) return res.status(400).json({ error: '消息不能为空' });
 
-  // 模型计费配置
-  const modelRates = {
-    'deepseek-chat': 2, 'deepseek-coder': 2, 'deepseek-reasoner': 15,
-    'qwen-turbo': 3, 'qwen-plus': 8, 'gpt-4o-mini': 5
-  };
-  const rate = modelRates[model] || 2;
-  const estCost = Math.max(1, rate); // 简化：按次固定扣费
+  const selectedModel = model || 'deepseek-chat';
 
+  // 从 config / MODEL_CATALOG 读取定价（单位：积分/1k tokens）
+  const pricing = config.modelPricing[selectedModel];
+  const rate = pricing ? pricing.rate : 2;
+  const estCost = Math.max(1, rate);
+
+  // 检查积分
   if (req.user.credits < estCost) {
     return res.status(402).json({ error: '积分不足', code: 'INSUFFICIENT_CREDITS' });
+  }
+
+  // 检查 Provider 是否已配置
+  if (!llmService.isApiKeyConfigured(selectedModel)) {
+    console.warn('[Chat] 模型 %s 未配置 API Key，降级到 mock', selectedModel);
   }
 
   // 设置 SSE 头
@@ -247,75 +254,35 @@ app.post('/api/chat/stream', auth, async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 
+  // 构建消息
+  const messages = [{ role: 'user', content: message }];
+
   try {
-    const apiKey = process.env.DEEPSEEK_API_KEY;
-    const baseUrl = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1';
+    // 使用 llmService 路由到正确的 Provider
+    const stream = llmService.streamChatCompletion(selectedModel, messages);
 
-    const apiRes = await fetch(baseUrl + '/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-      body: JSON.stringify({
-        model: model || 'deepseek-chat',
-        messages: [{ role: 'user', content: message }],
-        stream: true,
-        temperature: 0.7,
-        max_tokens: 4096,
-      }),
-    });
-
-    if (!apiRes.ok) {
-      const errText = await apiRes.text();
-      // API 调用失败，不扣积分
-      res.write('data: ' + JSON.stringify({ type: 'error', error: 'API错误: ' + apiRes.status + ' ' + errText.slice(0, 300) }) + '\n\n');
-      res.end();
-      return;
-    }
-
-    const reader = apiRes.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const result = await reader.read();
-      if (result.done) break;
-      buffer += decoder.decode(result.value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith('data: ')) continue;
-        const dataStr = trimmed.slice(6);
-        if (dataStr === '[DONE]') {
-          // 对话正常完成，扣除积分
-          db.prepare("UPDATE users SET credits = credits - ?, total_consumed = total_consumed + ? WHERE id = ? AND credits >= ?").run(estCost, estCost, req.user.id, estCost);
-          db.prepare(
-            "INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'consume', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)"
-          ).run(req.user.id, -estCost, req.user.id, 'AI对话-' + (model || 'deepseek-chat'), model || 'deepseek-chat');
-          const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
-          res.write('data: ' + JSON.stringify({ type: 'done', cost: estCost, balance: user.credits }) + '\n\n');
-          res.end();
-          return;
-        }
-        try {
-          const json = JSON.parse(dataStr);
-          const delta = json.choices && json.choices[0] && json.choices[0].delta;
-          if (delta && delta.content) {
-            res.write('data: ' + JSON.stringify({ type: 'token', content: delta.content }) + '\n\n');
-          }
-        } catch (e) {}
+    for await (const chunk of stream) {
+      if (chunk.type === 'token') {
+        res.write('data: ' + JSON.stringify({ type: 'token', content: chunk.content }) + '\n\n');
+      } else if (chunk.type === 'done') {
+        // 对话完成，扣除积分
+        db.prepare(
+          "UPDATE users SET credits = credits - ?, total_consumed = total_consumed + ? WHERE id = ? AND credits >= ?"
+        ).run(estCost, estCost, req.user.id, estCost);
+        db.prepare(
+          "INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'consume', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)"
+        ).run(req.user.id, -estCost, req.user.id, 'AI对话-' + selectedModel, selectedModel);
+        const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
+        res.write('data: ' + JSON.stringify({ type: 'done', cost: estCost, balance: user.credits }) + '\n\n');
+        res.end();
+        return;
       }
+      // usage 信息可选透传
     }
-    // 流读取完成，扣除积分
-    db.prepare("UPDATE users SET credits = credits - ?, total_consumed = total_consumed + ? WHERE id = ? AND credits >= ?").run(estCost, estCost, req.user.id, estCost);
-    db.prepare(
-      "INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'consume', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)"
-    ).run(req.user.id, -estCost, req.user.id, 'AI对话-' + (model || 'deepseek-chat'), model || 'deepseek-chat');
-    const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
-    res.write('data: ' + JSON.stringify({ type: 'done', cost: estCost, balance: user.credits }) + '\n\n');
+
     res.end();
   } catch (e) {
     console.error('[Chat] Error:', e.message);
-    // 异常不扣积分
     res.write('data: ' + JSON.stringify({ type: 'error', error: '对话失败: ' + e.message }) + '\n\n');
     res.end();
   }
