@@ -133,13 +133,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 // CORS: 限制为前端域名
 app.use(require('cors')({
-  origin: [
-    'https://aihub-frontend-alpha.vercel.app',
-    'https://aihub-frontend-pyom.vercel.app',
-    process.env.FRONTEND_URL,
-    'http://localhost:3000',
-    'http://localhost:3001',
-  ].filter(Boolean),
+  origin: true,  // 允许所有来源（CloudStudio/本地/Vercel）
   credentials: true,
 }));
 
