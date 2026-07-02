@@ -336,7 +336,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
   const providerConfigs = {
     deepseek: { apiKey: process.env.DEEPSEEK_API_KEY, baseUrl: (process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1') + '/chat/completions' },
     qwen:     { apiKey: process.env.QWEN_API_KEY,     baseUrl: (process.env.QWEN_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1') + '/chat/completions' },
-    openai:   { apiKey: process.env.OPENAI_API_KEY,   baseUrl: (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1') + '/chat/completions' },
+    doubao:   { apiKey: process.env.DOUBAO_API_KEY,   baseUrl: (process.env.DOUBAO_BASE_URL || 'https://ark.cn-beijing.volces.com/api/v3') + '/chat/completions' },
   };
   const provider = modelInfo ? modelInfo.provider : 'deepseek';
   const pc = providerConfigs[provider] || providerConfigs.deepseek;
@@ -803,7 +803,8 @@ app.get('/api/admin/profit', auth, (req, res) => {
     'deepseek-reasoner': 0.021,
     'qwen-turbo': 0.002,
     'qwen-plus': 0.005,
-    'gpt-4o-mini': 0.01,
+    'doubao-lite-32k': 0.003,
+    'doubao-pro-32k': 0.008,
     'image': 0.001,  // Pollinations 免费
   };
 
@@ -944,7 +945,7 @@ app.get('/api/config/status', (req, res) => {
     providers: {
       deepseek: !!(process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY.length > 10),
       qwen: !!(process.env.QWEN_API_KEY && process.env.QWEN_API_KEY.length > 10),
-      openai: !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 10),
+      doubao: !!(process.env.DOUBAO_API_KEY && process.env.DOUBAO_API_KEY.length > 10),
       image: true,  // Pollinations 免费 API 已接入
     },
     payment: {
@@ -1127,18 +1128,18 @@ const MODEL_CATALOG = [
   { id: 'qwen-turbo', name: '通义千问 Turbo', provider: 'qwen', tier: 'basic', tierLabel: '入门档', costPer1k: 2, desc: '通义千问快速版，性价比高', icon: '🧠' },
   { id: 'qwen-plus', name: '通义千问 Plus', provider: 'qwen', tier: 'advanced', tierLabel: '进阶档', costPer1k: 4, desc: '通义千问增强版，中文理解能力强', icon: '⚡' },
   { id: 'qwen-max', name: '通义千问 Max', provider: 'qwen', tier: 'flagship', tierLabel: '旗舰档', costPer1k: 10, desc: '通义千问旗舰模型，能力全面', icon: '🏆' },
-  // OpenAI
-  { id: 'gpt-4o-mini', name: 'GPT-4o mini', provider: 'openai', tier: 'advanced', tierLabel: '进阶档', costPer1k: 5, desc: 'OpenAI 轻量级模型，响应快速', icon: '⚡' },
-  { id: 'gpt-4o', name: 'GPT-4o', provider: 'openai', tier: 'flagship', tierLabel: '旗舰档', costPer1k: 12, desc: 'OpenAI 旗舰多模态模型，能力全面', icon: '🏆' },
+  // 豆包 (火山引擎 Ark)
+  { id: 'doubao-lite-32k', name: '豆包 Lite', provider: 'doubao', tier: 'advanced', tierLabel: '进阶档', costPer1k: 2, desc: '字节跳动轻量级模型，响应快速性价比高', icon: '⚡' },
+  { id: 'doubao-pro-32k', name: '豆包 Pro', provider: 'doubao', tier: 'flagship', tierLabel: '旗舰档', costPer1k: 5, desc: '字节跳动旗舰模型，中文能力强', icon: '🏆' },
 ];
 app.get('/api/models', (req, res) => {
   const hasDeepSeek = !!(process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY.length > 10);
   const hasQwen = !!(process.env.QWEN_API_KEY && process.env.QWEN_API_KEY.length > 10);
-  const hasOpenAI = !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.length > 10);
+  const hasDoubao = !!(process.env.DOUBAO_API_KEY && process.env.DOUBAO_API_KEY.length > 10);
   const enabledProviders = new Set();
   if (hasDeepSeek) enabledProviders.add('deepseek');
   if (hasQwen) enabledProviders.add('qwen');
-  if (hasOpenAI) enabledProviders.add('openai');
+  if (hasDoubao) enabledProviders.add('doubao');
   const models = MODEL_CATALOG.filter(m => enabledProviders.has(m.provider));
   res.json({ success: true, models });
 });
