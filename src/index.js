@@ -337,6 +337,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
     deepseek: { apiKey: process.env.DEEPSEEK_API_KEY, baseUrl: (process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1') + '/chat/completions' },
     qwen:     { apiKey: process.env.QWEN_API_KEY,     baseUrl: (process.env.QWEN_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1') + '/chat/completions' },
     doubao:   { apiKey: process.env.DOUBAO_API_KEY,   baseUrl: (process.env.DOUBAO_BASE_URL || 'https://ark.cn-beijing.volces.com/api/v3') + '/chat/completions' },
+    mimo:     { apiKey: process.env.MIMO_API_KEY,     baseUrl: (process.env.MIMO_BASE_URL || 'https://api.xiaomimimo.com/v1') + '/chat/completions' },
   };
   const provider = modelInfo ? modelInfo.provider : 'deepseek';
   const pc = providerConfigs[provider] || providerConfigs.deepseek;
@@ -805,6 +806,8 @@ app.get('/api/admin/profit', auth, (req, res) => {
     'qwen-plus': 0.005,
     'doubao-lite-32k': 0.003,
     'doubao-pro-32k': 0.008,
+    'mimo-v2.5': 0.003,
+    'mimo-v2.5-pro': 0.009,
     'image': 0.001,  // Pollinations 免费
   };
 
@@ -946,6 +949,7 @@ app.get('/api/config/status', (req, res) => {
       deepseek: !!(process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY.length > 10),
       qwen: !!(process.env.QWEN_API_KEY && process.env.QWEN_API_KEY.length > 10),
       doubao: !!(process.env.DOUBAO_API_KEY && process.env.DOUBAO_API_KEY.length > 10),
+      mimo: !!(process.env.MIMO_API_KEY && process.env.MIMO_API_KEY.length > 10),
       image: true,  // Pollinations 免费 API 已接入
     },
     payment: {
@@ -1131,15 +1135,20 @@ const MODEL_CATALOG = [
   // 豆包 (火山引擎 Ark)
   { id: 'doubao-lite-32k', name: '豆包 Lite', provider: 'doubao', tier: 'advanced', tierLabel: '进阶档', costPer1k: 2, desc: '字节跳动轻量级模型，响应快速性价比高', icon: '⚡' },
   { id: 'doubao-pro-32k', name: '豆包 Pro', provider: 'doubao', tier: 'flagship', tierLabel: '旗舰档', costPer1k: 5, desc: '字节跳动旗舰模型，中文能力强', icon: '🏆' },
+  // 小米 MiMo
+  { id: 'mimo-v2.5', name: 'MiMo-V2.5', provider: 'mimo', tier: 'advanced', tierLabel: '进阶档', costPer1k: 3, desc: '小米全模态模型，支持图像/视频/音频理解', icon: '🎯' },
+  { id: 'mimo-v2.5-pro', name: 'MiMo-V2.5 Pro', provider: 'mimo', tier: 'flagship', tierLabel: '旗舰档', costPer1k: 8, desc: '小米旗舰模型，1M超长上下文，媲美Claude Opus', icon: '🏆' },
 ];
 app.get('/api/models', (req, res) => {
   const hasDeepSeek = !!(process.env.DEEPSEEK_API_KEY && process.env.DEEPSEEK_API_KEY.length > 10);
   const hasQwen = !!(process.env.QWEN_API_KEY && process.env.QWEN_API_KEY.length > 10);
   const hasDoubao = !!(process.env.DOUBAO_API_KEY && process.env.DOUBAO_API_KEY.length > 10);
+  const hasMimo = !!(process.env.MIMO_API_KEY && process.env.MIMO_API_KEY.length > 10);
   const enabledProviders = new Set();
   if (hasDeepSeek) enabledProviders.add('deepseek');
   if (hasQwen) enabledProviders.add('qwen');
   if (hasDoubao) enabledProviders.add('doubao');
+  if (hasMimo) enabledProviders.add('mimo');
   const models = MODEL_CATALOG.filter(m => enabledProviders.has(m.provider));
   res.json({ success: true, models });
 });
