@@ -14,6 +14,11 @@ if (!JWT_SECRET) {
   console.error('[CRITICAL] JWT_SECRET 未设置！请配置环境变量后重启。');
   process.exit(1);
 }
+if (JWT_SECRET.length < 32 || JWT_SECRET === 'your-secret-key' || JWT_SECRET === 'change-me') {
+  console.error('[CRITICAL] JWT_SECRET 太弱或为默认值（长度需≥32字符），请生成强随机密钥后设置到环境变量。');
+  console.error('[CRITICAL] 生成密钥示例: node -e "console.log(require(\'crypto\').randomBytes(64).toString(\'hex\'))"');
+  process.exit(1);
+}
 // 持久化路径：优先使用 DB_PATH；在 Railway 环境默认使用 /data/aihub.db，便于挂载 Railway Volume
 const DB_PATH = process.env.DB_PATH || (process.env.RAILWAY_ENVIRONMENT_NAME ? '/data/aihub.db' : path.join(__dirname, 'data', 'aihub.db'));
 
@@ -102,12 +107,14 @@ db.exec(`
   );
 `);
 
-// 种子数据：管理员
-const adminExists = db.prepare('SELECT id FROM users WHERE phone = ?').get('15915777289');
+// 种子数据：管理员（首次启动时从环境变量读取，之后数据库已有则忽略）
+const ADMIN_PHONE = process.env.ADMIN_PHONE || '15915777289';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'hmf123456';
+const adminExists = db.prepare('SELECT id FROM users WHERE phone = ?').get(ADMIN_PHONE);
 if (!adminExists) {
-  const hash = bcrypt.hashSync('hmf123456', 10);
-  db.prepare("INSERT INTO users (phone, password_hash, nickname, credits, role) VALUES ('15915777289', ?, '管理员', 999999, 'admin')").run(hash);
-  console.log('[DB] Admin created: phone=15915777289 password=hmf123456');
+  const hash = bcrypt.hashSync(ADMIN_PASSWORD, 10);
+  db.prepare("INSERT INTO users (phone, password_hash, nickname, credits, role) VALUES (?, ?, '管理员', 999999, 'admin')").run(ADMIN_PHONE, hash);
+  console.log('[DB] Admin account created for phone:', ADMIN_PHONE);
 }
 
 // 兼容旧表：添加 PayPal 相关字段
@@ -131,9 +138,25 @@ app.use('/api/payment/wechat-notify', express.raw({ type: 'application/json' }))
 app.use('/api/payment/alipay-notify', express.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-// CORS: 限制为前端域名
+// 安全 Headers（手动实现，避免额外依赖）
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  if (isProduction) {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+// CORS: 生产环境限制为前端域名白名单，开发环境允许所有来源
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || '').split(',').filter(Boolean);
+const isProduction = process.env.NODE_ENV === 'production';
 app.use(require('cors')({
-  origin: true,  // 允许所有来源（CloudStudio/本地/Vercel）
+  origin: isProduction && ALLOWED_ORIGINS.length > 0
+    ? ALLOWED_ORIGINS
+    : true,
   credentials: true,
 }));
 
@@ -161,6 +184,10 @@ const rateLimiter = (maxRequests, windowMs) => {
 app.use('/api/auth/register', rateLimiter(5, 60000));  // 注册：每分钟5次
 app.use('/api/auth/login', rateLimiter(10, 60000));     // 登录：每分钟10次
 app.use('/api/user/check-in', rateLimiter(3, 60000));   // 签到：每分钟3次
+app.use('/api/chat/stream', rateLimiter(30, 60000));    // 对话：每分钟30次
+app.use('/api/image/generate', rateLimiter(10, 60000)); // 绘画：每分钟10次
+app.use('/api/payment/create-paypal-order', rateLimiter(10, 60000));  // 创建支付：每分钟10次
+app.use('/api/payment/capture-paypal-order', rateLimiter(10, 60000)); // 捕获支付：每分钟10次
 
 // 静态文件：前端页面
 app.use(express.static(path.join(__dirname, '..')));
@@ -266,6 +293,14 @@ app.post('/api/chat/stream', auth, async (req, res) => {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 
+  let creditsDeducted = false;  // 防止重复扣分/断连后扣分
+  // 客户端断连时，如果还没扣分则不扣
+  req.on('close', () => {
+    if (!creditsDeducted) {
+      console.log('[Chat] 客户端断连，未扣除积分');
+    }
+  });
+
   try {
     const apiRes = await fetch(pc.baseUrl, {
       method: 'POST',
@@ -306,6 +341,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
           db.prepare(
             "INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'consume', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)"
           ).run(req.user.id, -estCost, req.user.id, 'AI对话-' + selectedModel, selectedModel);
+          creditsDeducted = true;
           const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
           res.write('data: ' + JSON.stringify({ type: 'done', cost: estCost, balance: user.credits }) + '\n\n');
           res.end();
@@ -325,12 +361,15 @@ app.post('/api/chat/stream', auth, async (req, res) => {
     db.prepare(
       "INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'consume', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)"
     ).run(req.user.id, -estCost, req.user.id, 'AI对话-' + selectedModel, selectedModel);
+    creditsDeducted = true;
     const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
     res.write('data: ' + JSON.stringify({ type: 'done', cost: estCost, balance: user.credits }) + '\n\n');
     res.end();
   } catch (e) {
     console.error('[Chat] Error:', e.message);
-    res.write('data: ' + JSON.stringify({ type: 'error', error: '对话失败: ' + e.message }) + '\n\n');
+    if (!creditsDeducted) {
+      res.write('data: ' + JSON.stringify({ type: 'error', error: '对话失败: ' + e.message }) + '\n\n');
+    }
     res.end();
   }
 });
@@ -531,7 +570,11 @@ app.post('/api/payment/create-order', auth, (req, res) => {
 });
 
 // --- 微信支付 / 支付宝支付 ---
-require('./payment')(app, db);
+try {
+  require('./payment')(app, db);
+} catch (e) {
+  console.log('[Payment] 微信/支付宝支付模块未安装，跳过。如需使用请创建 payment.js');
+}
 
 // --- 积分流水 ---
 app.get('/api/user/transactions', auth, (req, res) => {
@@ -881,7 +924,10 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('[AIHub] Server running at http://localhost:' + PORT);
-  console.log('[AIHub] Frontend: http://localhost:' + PORT);
-  console.log('[AIHub] Admin: phone=15915777289 password=hmf123456');
+  if (process.env.NODE_ENV !== 'production') {
+    console.log('[AIHub] Admin phone:', ADMIN_PHONE, '(dev mode only)');
+  } else {
+    console.log('[AIHub] Running in production mode');
+  }
   console.log('[AIHub] Test user: register any phone + password');
 });
