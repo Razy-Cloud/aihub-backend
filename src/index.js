@@ -105,6 +105,14 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now','localtime')),
     UNIQUE(user_id, check_date)
   );
+  CREATE TABLE IF NOT EXISTS refresh_tokens (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at TEXT DEFAULT (datetime('now','localtime')),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);
 `);
 
 // 种子数据：管理员（首次启动时从环境变量读取，之后数据库已有则忽略）
@@ -134,9 +142,43 @@ db.exec(`
 `);
 
 // ===== 内存存储 =====
-const refreshTokens = new Map(); // userId -> { token, expiresAt }
 const resetCodes = new Map();    // code -> { phone, expiresAt }
 const emailCodes = new Map();    // code -> { email, expiresAt, type }  type: 'register'|'reset'
+
+// ===== Refresh Token 持久化（SQLite） =====
+const REFRESH_TOKEN_TTL = 30 * 24 * 3600 * 1000; // 30天
+
+// 保存 refresh token（登录/轮换时调用，自动清理该用户旧 token）
+function saveRefreshToken(userId, token) {
+  // 先删除该用户的旧 token（每次只保留最新的）
+  db.prepare('DELETE FROM refresh_tokens WHERE user_id = ?').run(userId);
+  db.prepare('INSERT INTO refresh_tokens (token, user_id, expires_at) VALUES (?, ?, ?)').run(
+    token, userId, Date.now() + REFRESH_TOKEN_TTL
+  );
+}
+
+// 验证 refresh token，返回 userId 或 null
+function verifyRefreshToken(token) {
+  const row = db.prepare('SELECT user_id, expires_at FROM refresh_tokens WHERE token = ?').get(token);
+  if (!row) return null;
+  if (row.expires_at < Date.now()) {
+    // 已过期，清理掉
+    db.prepare('DELETE FROM refresh_tokens WHERE token = ?').run(token);
+    return null;
+  }
+  return row.user_id;
+}
+
+// 删除指定 refresh token（登出时调用）
+function revokeRefreshToken(token) {
+  db.prepare('DELETE FROM refresh_tokens WHERE token = ?').run(token);
+}
+
+// 定时清理过期 token（每小时执行一次）
+setInterval(() => {
+  const result = db.prepare('DELETE FROM refresh_tokens WHERE expires_at < ?').run(Date.now());
+  if (result.changes > 0) console.log('[DB] 清理过期 refresh tokens:', result.changes, '条');
+}, 3600 * 1000);
 
 // ===== 邮件发送器 =====
 let transporter = null;
@@ -286,9 +328,9 @@ app.post('/api/auth/login', (req, res) => {
   if (user.status === 'banned') return res.status(403).json({ error: '账号已封禁' });
   if (!bcrypt.compareSync(password, user.password_hash)) return res.status(401).json({ error: '密码错误' });
   const token = jwt.sign({ userId: user.id, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
-  // 生成 refresh token（30天有效，存储在内存中）
+  // 生成 refresh token（30天有效，持久化到 SQLite，服务器重启不掉线）
   const refreshToken = require('crypto').randomBytes(32).toString('hex');
-  refreshTokens.set(user.id, { token: refreshToken, expiresAt: Date.now() + 30 * 24 * 3600 * 1000 });
+  saveRefreshToken(user.id, refreshToken);
   const safe = { id: user.id, phone: user.phone, nickname: user.nickname, credits: user.credits, role: user.role };
   res.json({ token, refreshToken, user: safe });
 });
@@ -1008,21 +1050,23 @@ app.delete('/api/conversations/:id', auth, (req, res) => {
 app.post('/api/auth/refresh', (req, res) => {
   const { refreshToken } = req.body;
   if (!refreshToken) return res.status(400).json({ error: 'refreshToken 必填' });
-  let matchedUserId = null;
-  for (const [uid, rt] of refreshTokens.entries()) {
-    if (rt.token === refreshToken && rt.expiresAt > Date.now()) {
-      matchedUserId = uid;
-      break;
-    }
-  }
+  const matchedUserId = verifyRefreshToken(refreshToken);
   if (!matchedUserId) return res.status(401).json({ error: 'refresh token 无效或已过期' });
   const user = db.prepare('SELECT id, role FROM users WHERE id = ?').get(matchedUserId);
   if (!user) return res.status(401).json({ error: '用户不存在' });
   const newToken = jwt.sign({ userId: user.id, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
-  // 轮换 refresh token
+  // 轮换 refresh token（旧的删除，新的存入）
+  revokeRefreshToken(refreshToken);
   const newRefreshToken = require('crypto').randomBytes(32).toString('hex');
-  refreshTokens.set(user.id, { token: newRefreshToken, expiresAt: Date.now() + 30 * 24 * 3600 * 1000 });
+  saveRefreshToken(user.id, newRefreshToken);
   res.json({ success: true, token: newToken, refreshToken: newRefreshToken });
+});
+
+// --- 登出（吊销 refresh token） ---
+app.post('/api/auth/logout', (req, res) => {
+  const { refreshToken } = req.body;
+  if (refreshToken) revokeRefreshToken(refreshToken);
+  res.json({ success: true, message: '已登出' });
 });
 
 // --- 邮箱验证码（统一入口：注册验证 + 密码重置） ---
