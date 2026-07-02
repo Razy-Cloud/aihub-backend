@@ -110,19 +110,20 @@ db.exec(`
 // 种子数据：管理员（首次启动时从环境变量读取，之后数据库已有则忽略）
 const ADMIN_PHONE = process.env.ADMIN_PHONE || '15915777289';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'hmf123456';
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || null;
 const adminExists = db.prepare('SELECT id FROM users WHERE phone = ?').get(ADMIN_PHONE);
 if (!adminExists) {
   const hash = bcrypt.hashSync(ADMIN_PASSWORD, 10);
-  db.prepare("INSERT INTO users (phone, password_hash, nickname, credits, role) VALUES (?, ?, '管理员', 999999, 'admin')").run(ADMIN_PHONE, hash);
+  db.prepare("INSERT INTO users (phone, email, email_verified, password_hash, nickname, credits, role) VALUES (?, ?, 1, ?, '管理员', 999999, 'admin')").run(ADMIN_PHONE, ADMIN_EMAIL, hash);
   console.log('[DB] Admin account created for phone:', ADMIN_PHONE);
 }
 
-// 兼容旧表：添加 PayPal 相关字段
-
+// 兼容旧表迁移
 try { db.exec('ALTER TABLE orders ADD COLUMN paid_at TEXT'); } catch (e) {}
 try { db.exec('ALTER TABLE orders ADD COLUMN paypal_order_id TEXT'); } catch (e) {}
 try { db.exec('ALTER TABLE credit_transactions ADD COLUMN related_order_id TEXT'); } catch (e) {}
 try { db.exec('ALTER TABLE orders ADD COLUMN payment_method TEXT'); } catch (e) {}
+try { db.exec('ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0'); } catch (e) {}
 
 // 创建高频查询索引
 db.exec(`
@@ -135,6 +136,37 @@ db.exec(`
 // ===== 内存存储 =====
 const refreshTokens = new Map(); // userId -> { token, expiresAt }
 const resetCodes = new Map();    // code -> { phone, expiresAt }
+const emailCodes = new Map();    // code -> { email, expiresAt, type }  type: 'register'|'reset'
+
+// ===== 邮件发送器 =====
+let transporter = null;
+let sendEmail = null;
+(function setupEmail() {
+  const smtpHost = process.env.SMTP_HOST;
+  if (smtpHost) {
+    try {
+      const nodemailer = require('nodemailer');
+      transporter = nodemailer.createTransport({
+        host: smtpHost,
+        port: parseInt(process.env.SMTP_PORT || '587'),
+        secure: process.env.SMTP_SECURE === 'true',
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      });
+      sendEmail = async function(to, subject, html) {
+        await transporter.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject, html });
+      };
+      console.log('[Email] SMTP 邮件发送已配置 (' + smtpHost + ')');
+    } catch (e) {
+      console.warn('[Email] nodemailer 未安装或配置错误:', e.message);
+    }
+  }
+  if (!sendEmail) {
+    sendEmail = async function(to, subject, html) {
+      console.log('[Email] (DEV) 未配置 SMTP，邮件内容:\n  To:', to, '\n  Subject:', subject);
+    };
+    console.log('[Email] 未配置 SMTP，邮件将仅打印到控制台（生产环境请配置 SMTP_* 环境变量）');
+  }
+})();
 
 // ===== 中间件 =====
 // 支付回调需要原始 body 用于验签，必须在 express.json() 之前挂载
@@ -214,25 +246,34 @@ function auth(req, res, next) {
 
 // ===== API 路由 =====
 
-// --- 注册 ---
+// --- 注册（邮箱必填 + 邮箱验证码） ---
 app.post('/api/auth/register', (req, res) => {
-  const { phone, password, nickname, email } = req.body;
+  const { phone, password, nickname, email, emailCode } = req.body;
   if (!phone || !password) return res.status(400).json({ error: '手机号和密码必填' });
+  if (!email) return res.status(400).json({ error: '邮箱必填，用于接收验证码和找回密码' });
+  if (!emailCode) return res.status(400).json({ error: '邮箱验证码必填' });
   if (!/^1\d{10}$/.test(phone)) return res.status(400).json({ error: '手机号格式不正确' });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: '邮箱格式不正确' });
   if (password.length < 6) return res.status(400).json({ error: '密码至少6位' });
-  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: '邮箱格式不正确' });
+  
+  // 验证邮箱验证码
+  const stored = emailCodes.get(emailCode);
+  if (!stored || stored.email !== email || stored.type !== 'register' || stored.expiresAt < Date.now()) {
+    return res.status(400).json({ error: '邮箱验证码无效或已过期' });
+  }
+  emailCodes.delete(emailCode); // 一次性使用
+  
   const exists = db.prepare('SELECT id FROM users WHERE phone = ?').get(phone);
   if (exists) return res.status(409).json({ error: '手机号已注册' });
-  if (email) {
-    const emailExists = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-    if (emailExists) return res.status(409).json({ error: '邮箱已被绑定' });
-  }
+  const emailExists = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  if (emailExists) return res.status(409).json({ error: '该邮箱已被注册' });
+  
   const hash = bcrypt.hashSync(password, 10);
-  const result = db.prepare("INSERT INTO users (phone, password_hash, nickname, email, credits) VALUES (?, ?, ?, ?, 50)").run(phone, hash, nickname || '新用户', email || null);
+  const result = db.prepare("INSERT INTO users (phone, password_hash, nickname, email, email_verified, credits) VALUES (?, ?, ?, ?, 1, 50)").run(phone, hash, nickname || '新用户', email);
   const userId = result.lastInsertRowid;
   db.prepare("INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description) VALUES (?, 'gift', 50, 50, 'system', '新用户注册赠送')").run(userId);
-  const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: '7d' });
   const user = db.prepare('SELECT id, phone, email, nickname, credits, role FROM users WHERE id = ?').get(userId);
+  const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: '7d' });
   res.json({ token, user });
 });
 
@@ -979,39 +1020,100 @@ app.post('/api/auth/refresh', (req, res) => {
   res.json({ success: true, token: newToken, refreshToken: newRefreshToken });
 });
 
-// --- 忘记密码 ---
+// --- 邮箱验证码（统一入口：注册验证 + 密码重置） ---
+app.post('/api/auth/send-email-code', async (req, res) => {
+  const { email, type } = req.body;
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: '邮箱格式不正确' });
+  if (!['register', 'reset'].includes(type)) return res.status(400).json({ error: 'type 必须是 register 或 reset' });
+  
+  if (type === 'register') {
+    const exists = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+    if (exists) return res.status(409).json({ error: '该邮箱已被注册' });
+  } else {
+    const user = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+    if (!user) return res.status(404).json({ error: '该邮箱未注册' });
+  }
+  
+  // 生成6位验证码（5分钟有效）
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  emailCodes.set(code, { email, type, expiresAt: Date.now() + 5 * 60 * 1000 });
+  
+  const subject = type === 'register' ? 'AIHub 注册验证码' : 'AIHub 密码重置验证码';
+  const html = `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:20px;border:1px solid #e0e0e0;border-radius:8px">
+    <h2 style="color:#6366f1;margin:0 0 16px">✦ AIHub</h2>
+    <p style="font-size:16px;color:#333">您的验证码是：</p>
+    <div style="background:#f5f3ff;padding:16px;border-radius:8px;text-align:center;margin:16px 0">
+      <span style="font-size:32px;font-weight:bold;color:#6366f1;letter-spacing:8px">${code}</span>
+    </div>
+    <p style="font-size:13px;color:#999">验证码 5 分钟内有效，请勿泄露给他人。</p>
+    ${type === 'register' ? '<p style="font-size:13px;color:#666">注册成功后赠送 50 积分，即刻体验 AI 对话！</p>' : ''}
+  </div>`;
+  
+  try {
+    await sendEmail(email, subject, html);
+    console.log('[Auth] 邮件验证码已发送:', email, 'type:', type, 'code:', code);
+    if (process.env.NODE_ENV === 'production') {
+      res.json({ success: true, message: '验证码已发送到您的邮箱' });
+    } else {
+      res.json({ success: true, message: '验证码已发送', code }); // 开发环境返回验证码
+    }
+  } catch (e) {
+    console.error('[Auth] 邮件发送失败:', e.message);
+    res.status(500).json({ error: '邮件发送失败，请稍后重试' });
+  }
+});
 
-// 发送短信验证码
+// --- 忘记密码（支持邮箱或手机号验证码） ---
+
+// 发送手机验证码（短信，保留兼容）
 app.post('/api/auth/send-code', (req, res) => {
   const { phone } = req.body;
   if (!phone || !/^1[3-9]\d{9}$/.test(phone)) return res.status(400).json({ error: '手机号格式不正确' });
   const user = db.prepare('SELECT id FROM users WHERE phone = ?').get(phone);
   if (!user) return res.status(404).json({ error: '该手机号未注册' });
-  // 生成6位验证码（5分钟有效）
   const code = String(Math.floor(100000 + Math.random() * 900000));
   resetCodes.set(code, { phone, expiresAt: Date.now() + 5 * 60 * 1000 });
-  // 真实环境需对接短信服务商，此处仅打印和返回（DEV模式）
-  console.log('[Auth] 验证码 (DEV): phone=' + phone + ' code=' + code);
+  console.log('[Auth] 短信验证码 (DEV): phone=' + phone + ' code=' + code);
   if (process.env.NODE_ENV === 'production') {
     res.json({ success: true, message: '验证码已发送' });
   } else {
-    res.json({ success: true, message: '验证码已发送', code }); // 开发环境返回验证码
+    res.json({ success: true, message: '验证码已发送', code });
   }
 });
 
-// 用验证码重置密码
+// 重置密码（支持邮箱验证码 或 手机验证码）
 app.post('/api/auth/reset-password', (req, res) => {
-  const { phone, code, newPassword } = req.body;
-  if (!phone || !code || !newPassword) return res.status(400).json({ error: '手机号、验证码、新密码缺一不可' });
+  const { phone, email, code, newPassword } = req.body;
+  if (!code || !newPassword) return res.status(400).json({ error: '验证码和新密码缺一不可' });
   if (newPassword.length < 6) return res.status(400).json({ error: '密码至少6位' });
-  // 验证码校验
-  const stored = resetCodes.get(code);
-  if (!stored || stored.phone !== phone || stored.expiresAt < Date.now()) {
-    return res.status(400).json({ error: '验证码无效或已过期' });
+  
+  let targetPhone = phone;
+  let targetEmail = email;
+  
+  // 先尝试邮箱验证码
+  if (targetEmail) {
+    const stored = emailCodes.get(code);
+    if (!stored || stored.email !== targetEmail || stored.type !== 'reset' || stored.expiresAt < Date.now()) {
+      return res.status(400).json({ error: '邮箱验证码无效或已过期' });
+    }
+    emailCodes.delete(code);
+  } else if (targetPhone) {
+    // 再尝试短信验证码
+    const stored = resetCodes.get(code);
+    if (!stored || stored.phone !== targetPhone || stored.expiresAt < Date.now()) {
+      return res.status(400).json({ error: '验证码无效或已过期' });
+    }
+    resetCodes.delete(code);
+  } else {
+    return res.status(400).json({ error: '请提供手机号或邮箱' });
   }
-  resetCodes.delete(code); // 一次性使用
+  
   const hash = bcrypt.hashSync(newPassword, 10);
-  db.prepare('UPDATE users SET password_hash = ?, updated_at = datetime(\'now\',\'localtime\') WHERE phone = ?').run(hash, phone);
+  if (targetEmail) {
+    db.prepare('UPDATE users SET password_hash = ?, updated_at = datetime(\'now\',\'localtime\') WHERE email = ?').run(hash, targetEmail);
+  } else {
+    db.prepare('UPDATE users SET password_hash = ?, updated_at = datetime(\'now\',\'localtime\') WHERE phone = ?').run(hash, targetPhone);
+  }
   res.json({ success: true, message: '密码重置成功，请重新登录' });
 });
 
