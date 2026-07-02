@@ -132,6 +132,10 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id);
 `);
 
+// ===== 内存存储 =====
+const refreshTokens = new Map(); // userId -> { token, expiresAt }
+const resetCodes = new Map();    // code -> { phone, expiresAt }
+
 // ===== 中间件 =====
 // 支付回调需要原始 body 用于验签，必须在 express.json() 之前挂载
 app.use('/api/payment/wechat-notify', express.raw({ type: 'application/json' }));
@@ -240,9 +244,12 @@ app.post('/api/auth/login', (req, res) => {
   if (!user) return res.status(401).json({ error: '用户不存在' });
   if (user.status === 'banned') return res.status(403).json({ error: '账号已封禁' });
   if (!bcrypt.compareSync(password, user.password_hash)) return res.status(401).json({ error: '密码错误' });
-  const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
+  const token = jwt.sign({ userId: user.id, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
+  // 生成 refresh token（30天有效，存储在内存中）
+  const refreshToken = require('crypto').randomBytes(32).toString('hex');
+  refreshTokens.set(user.id, { token: refreshToken, expiresAt: Date.now() + 30 * 24 * 3600 * 1000 });
   const safe = { id: user.id, phone: user.phone, nickname: user.nickname, credits: user.credits, role: user.role };
-  res.json({ token, user: safe });
+  res.json({ token, refreshToken, user: safe });
 });
 
 // --- 当前用户 ---
@@ -267,6 +274,22 @@ app.post('/api/chat/stream', auth, async (req, res) => {
   if (req.user.credits < estCost) {
     return res.status(402).json({ error: '积分不足', code: 'INSUFFICIENT_CREDITS' });
   }
+
+  // --- 对话历史：创建/验证会话 ---
+  let sessionId = req.body.sessionId;
+  if (sessionId) {
+    // 验证会话属于当前用户
+    const session = db.prepare('SELECT id FROM chat_sessions WHERE id = ? AND user_id = ?').get(sessionId, req.user.id);
+    if (!session) sessionId = null; // 不存在或不属于用户，新建
+  }
+  if (!sessionId) {
+    sessionId = uuidv4();
+    const title = message.length > 30 ? message.slice(0, 30) + '...' : message;
+    db.prepare('INSERT INTO chat_sessions (id, user_id, title, model) VALUES (?, ?, ?, ?)').run(sessionId, req.user.id, title, selectedModel);
+  }
+  // 保存用户消息
+  db.prepare('INSERT INTO chat_messages (session_id, user_id, role, content, model) VALUES (?, ?, ?, ?, ?)').run(sessionId, req.user.id, 'user', message, selectedModel);
+  let aiResponse = '';
 
   // Provider 路由配置（根据模型自动选择）
   const providerConfigs = {
@@ -342,8 +365,10 @@ app.post('/api/chat/stream', auth, async (req, res) => {
             "INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'consume', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)"
           ).run(req.user.id, -estCost, req.user.id, 'AI对话-' + selectedModel, selectedModel);
           creditsDeducted = true;
+          // 保存 AI 回复到对话历史
+          db.prepare('INSERT INTO chat_messages (session_id, user_id, role, content, model, credits_used) VALUES (?, ?, ?, ?, ?, ?)').run(sessionId, req.user.id, 'assistant', aiResponse, selectedModel, estCost);
           const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
-          res.write('data: ' + JSON.stringify({ type: 'done', cost: estCost, balance: user.credits }) + '\n\n');
+          res.write('data: ' + JSON.stringify({ type: 'done', cost: estCost, balance: user.credits, sessionId: sessionId }) + '\n\n');
           res.end();
           return;
         }
@@ -351,6 +376,7 @@ app.post('/api/chat/stream', auth, async (req, res) => {
           const json = JSON.parse(dataStr);
           const delta = json.choices && json.choices[0] && json.choices[0].delta;
           if (delta && delta.content) {
+            aiResponse += delta.content;
             res.write('data: ' + JSON.stringify({ type: 'token', content: delta.content }) + '\n\n');
           }
         } catch (e) {}
@@ -362,11 +388,17 @@ app.post('/api/chat/stream', auth, async (req, res) => {
       "INSERT INTO credit_transactions (user_id, type, amount, balance_after, source, description, model) VALUES (?, 'consume', ?, (SELECT credits FROM users WHERE id = ?), 'chat', ?, ?)"
     ).run(req.user.id, -estCost, req.user.id, 'AI对话-' + selectedModel, selectedModel);
     creditsDeducted = true;
+    // 保存 AI 回复到对话历史
+    db.prepare('INSERT INTO chat_messages (session_id, user_id, role, content, model, credits_used) VALUES (?, ?, ?, ?, ?, ?)').run(sessionId, req.user.id, 'assistant', aiResponse, selectedModel, estCost);
     const user = db.prepare('SELECT credits FROM users WHERE id = ?').get(req.user.id);
-    res.write('data: ' + JSON.stringify({ type: 'done', cost: estCost, balance: user.credits }) + '\n\n');
+    res.write('data: ' + JSON.stringify({ type: 'done', cost: estCost, balance: user.credits, sessionId: sessionId }) + '\n\n');
     res.end();
   } catch (e) {
     console.error('[Chat] Error:', e.message);
+    // 如果有部分 AI 回复，也保存到历史
+    if (aiResponse && aiResponse.length > 0) {
+      try { db.prepare('INSERT INTO chat_messages (session_id, user_id, role, content, model, credits_used) VALUES (?, ?, ?, ?, ?, ?)').run(sessionId, req.user.id, 'assistant', aiResponse, selectedModel, estCost); } catch (_) {}
+    }
     if (!creditsDeducted) {
       res.write('data: ' + JSON.stringify({ type: 'error', error: '对话失败: ' + e.message }) + '\n\n');
     }
@@ -571,7 +603,7 @@ app.post('/api/payment/create-order', auth, (req, res) => {
 
 // --- 微信支付 / 支付宝支付 ---
 try {
-  require('./payment')(app, db);
+  require('./payment')(app, db, auth);
 } catch (e) {
   console.log('[Payment] 微信/支付宝支付模块未安装，跳过。如需使用请创建 payment.js');
 }
@@ -883,6 +915,104 @@ app.get('/api/config/status', (req, res) => {
     },
     version: '1.0.0',
   });
+});
+
+// --- 对话历史管理 ---
+
+// 获取用户的对话会话列表
+app.get('/api/conversations', auth, (req, res) => {
+  const { page = 1, limit = 20 } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  const sessions = db.prepare(
+    'SELECT s.id, s.title, s.model, s.created_at, (SELECT COUNT(*) FROM chat_messages WHERE session_id = s.id) as msg_count FROM chat_sessions s WHERE s.user_id = ? ORDER BY s.created_at DESC LIMIT ? OFFSET ?'
+  ).all(req.user.id, parseInt(limit), offset);
+  const total = db.prepare('SELECT COUNT(*) as c FROM chat_sessions WHERE user_id = ?').get(req.user.id).c;
+  res.json({ success: true, sessions, total, page: parseInt(page), limit: parseInt(limit) });
+});
+
+// 创建新对话（空会话，前端可预创建）
+app.post('/api/conversations', auth, (req, res) => {
+  const { title } = req.body;
+  const id = uuidv4();
+  db.prepare('INSERT INTO chat_sessions (id, user_id, title) VALUES (?, ?, ?)').run(id, req.user.id, title || '新对话');
+  const session = db.prepare('SELECT * FROM chat_sessions WHERE id = ?').get(id);
+  res.json({ success: true, session });
+});
+
+// 获取指定对话的消息列表
+app.get('/api/conversations/:id/messages', auth, (req, res) => {
+  const session = db.prepare('SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
+  if (!session) return res.status(404).json({ error: '对话不存在' });
+  const messages = db.prepare('SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC').all(req.params.id);
+  res.json({ success: true, session, messages });
+});
+
+// 删除对话及其所有消息
+app.delete('/api/conversations/:id', auth, (req, res) => {
+  const session = db.prepare('SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?').get(req.params.id, req.user.id);
+  if (!session) return res.status(404).json({ error: '对话不存在' });
+  db.prepare('DELETE FROM chat_messages WHERE session_id = ?').run(req.params.id);
+  db.prepare('DELETE FROM chat_sessions WHERE id = ?').run(req.params.id);
+  res.json({ success: true, message: '对话已删除' });
+});
+
+// --- Token 刷新 ---
+
+// 用 refresh_token 换新的 access_token（轮换机制）
+app.post('/api/auth/refresh', (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) return res.status(400).json({ error: 'refreshToken 必填' });
+  let matchedUserId = null;
+  for (const [uid, rt] of refreshTokens.entries()) {
+    if (rt.token === refreshToken && rt.expiresAt > Date.now()) {
+      matchedUserId = uid;
+      break;
+    }
+  }
+  if (!matchedUserId) return res.status(401).json({ error: 'refresh token 无效或已过期' });
+  const user = db.prepare('SELECT id, role FROM users WHERE id = ?').get(matchedUserId);
+  if (!user) return res.status(401).json({ error: '用户不存在' });
+  const newToken = jwt.sign({ userId: user.id, role: user.role }, JWT_SECRET, { expiresIn: '1h' });
+  // 轮换 refresh token
+  const newRefreshToken = require('crypto').randomBytes(32).toString('hex');
+  refreshTokens.set(user.id, { token: newRefreshToken, expiresAt: Date.now() + 30 * 24 * 3600 * 1000 });
+  res.json({ success: true, token: newToken, refreshToken: newRefreshToken });
+});
+
+// --- 忘记密码 ---
+
+// 发送短信验证码
+app.post('/api/auth/send-code', (req, res) => {
+  const { phone } = req.body;
+  if (!phone || !/^1[3-9]\d{9}$/.test(phone)) return res.status(400).json({ error: '手机号格式不正确' });
+  const user = db.prepare('SELECT id FROM users WHERE phone = ?').get(phone);
+  if (!user) return res.status(404).json({ error: '该手机号未注册' });
+  // 生成6位验证码（5分钟有效）
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  resetCodes.set(code, { phone, expiresAt: Date.now() + 5 * 60 * 1000 });
+  // 真实环境需对接短信服务商，此处仅打印和返回（DEV模式）
+  console.log('[Auth] 验证码 (DEV): phone=' + phone + ' code=' + code);
+  if (process.env.NODE_ENV === 'production') {
+    res.json({ success: true, message: '验证码已发送' });
+  } else {
+    res.json({ success: true, message: '验证码已发送', code }); // 开发环境返回验证码
+  }
+});
+
+// 用验证码重置密码
+app.post('/api/auth/reset-password', (req, res) => {
+  const { phone, code, newPassword } = req.body;
+  if (!phone || !code || !newPassword) return res.status(400).json({ error: '手机号、验证码、新密码缺一不可' });
+  if (newPassword.length < 6) return res.status(400).json({ error: '密码至少6位' });
+  // 验证码校验
+  const stored = resetCodes.get(code);
+  if (!stored || stored.phone !== phone || stored.expiresAt < Date.now()) {
+    return res.status(400).json({ error: '验证码无效或已过期' });
+  }
+  resetCodes.delete(code); // 一次性使用
+  const hash = bcrypt.hashSync(newPassword, 10);
+  db.prepare('UPDATE users SET password_hash = ?, updated_at = datetime(\'now\',\'localtime\') WHERE phone = ?').run(hash, phone);
+  res.json({ success: true, message: '密码重置成功，请重新登录' });
 });
 
 // 模型列表（根据已配置的提供商动态返回）
